@@ -31,7 +31,10 @@ ENV PORT=5000
 COPY --from=deps /app/node_modules ./node_modules
 
 # Copy application source code
-COPY . .
+COPY --chown=node:node . .
+
+# Create runtime directories with write permissions for node user
+RUN mkdir -p /app/thumbnails && chown -R node:node /app
 
 # Expose backend application port
 EXPOSE 5000
