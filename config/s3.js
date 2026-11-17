@@ -5,7 +5,7 @@ const path = require("path");
 
 // AWS S3 Configuration
 const s3Client = new S3Client({
-  region: process.env.AWS_REGION || 'ap-south-1',
+  region: process.env.AWS_REGION || 'us-east-2',
   credentials: {
     accessKeyId: process.env.AWS_ACCESS_KEY_ID || '',
     secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY || ''
@@ -13,8 +13,8 @@ const s3Client = new S3Client({
 });
 
 // S3 Bucket Configuration
-const BUCKET_NAME = process.env.S3_BUCKET_NAME || 'sl-music-publications';
-const BUCKET_REGION = process.env.AWS_REGION || 'ap-south-1';
+const BUCKET_NAME = process.env.S3_BUCKET_NAME || 'sl-music-publication';
+const BUCKET_REGION = process.env.AWS_REGION || 'us-east-2';
 
 // Helper function to create safe user folder structure
 const makeSafeUserFolder = (user) => {
