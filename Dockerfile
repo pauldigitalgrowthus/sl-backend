@@ -1,52 +1,46 @@
 # ==============================================================================
-# Multi-Stage Dockerfile with Google Distroless for sl-backend
+# Multi-Stage Dockerfile for sl-backend
 # Supports: UAT and Production environments
 # ==============================================================================
 
 # ------------------------------------------------------------------------------
-# Stage 1: Dependency Installation & Build Preparation
+# Stage 1: Dependency Installation
 # ------------------------------------------------------------------------------
-FROM node:22-bookworm-slim AS builder
+FROM node:20-bookworm-slim AS deps
 
 WORKDIR /app
 
-# Install build dependencies if native addons require compilation
-RUN apt-get update && apt-get install -y --no-install-recommends \
-    python3 \
-    make \
-    g++ \
-    && rm -rf /var/lib/apt/lists/*
+ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 
-# Copy package descriptors
 COPY package*.json ./
 
-# Install production dependencies only
-RUN npm ci --omit=dev --ignore-scripts && npm rebuild
+RUN npm ci --omit=dev
 
 # ------------------------------------------------------------------------------
-# Stage 2: Distroless Production/UAT Runtime Image
-# Minimal attack surface: No shell, no package manager, non-root user
+# Stage 2: Runtime Image
 # ------------------------------------------------------------------------------
-FROM gcr.io/distroless/nodejs22-debian12:nonroot AS runner
+FROM node:20-bookworm-slim AS runner
 
 WORKDIR /app
 
-# Environment variables
 ARG APP_ENV=production
 ENV NODE_ENV=${APP_ENV}
 ENV PORT=5000
 
-# Copy node_modules from builder
-COPY --from=builder --chown=nonroot:nonroot /app/node_modules ./node_modules
+# Copy node_modules from deps stage
+COPY --from=deps /app/node_modules ./node_modules
 
-# Copy application source code (excluded items filtered via .dockerignore)
-COPY --chown=nonroot:nonroot . .
+# Copy application source code
+COPY . .
 
 # Expose backend application port
 EXPOSE 5000
 
-# Run container as secure non-root user (UID 65532)
-USER nonroot
+# Use secure unprivileged node user
+USER node
 
-# Google Distroless nodejs image has node as entrypoint
-CMD ["server.js"]
+# Health check
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+  CMD node -e "require('http').get('http://localhost:' + (process.env.PORT || 5000) + '/', (r) => { process.exit(r.statusCode < 500 ? 0 : 1); }).on('error', () => process.exit(1));"
+
+CMD ["node", "server.js"]
