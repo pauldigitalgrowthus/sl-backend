@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Parish Subscription Payment</title>
+    <meta charset="UTF-8" />
+</head>
+
+<body style="font-family: Arial; text-align: center; margin-top: 80px;">
+
+    <h2>Parish Annual Subscription</h2>
+    <p><strong>$720 / year</strong></p>
+
+    <div style="margin-top:20px;">
+        <button id="cardBtn" style="padding:10px 20px; font-size:16px; margin-right:10px;">
+            Pay with Card
+        </button>
+
+        <button id="achBtn" style="padding:10px 20px; font-size:16px;">
+            Pay with ACH
+        </button>
+    </div>
+
+    <p id="status" style="margin-top:30px;"></p>
+
+    <script>
+        const BASE_URL = "http://localhost:5000"; // change if needed
+        const PLAN_ID = 7; // 🔥 change to your subscriberAdmin plan id
+
+        // 🔐 JWT Token
+        const token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJ1c2VySWQiOjg5LCJpYXQiOjE3NzEzMzcyODYsImV4cCI6MTc3MTQyMzY4Nn0.TM7hR5dH3pv21IxwArBS_F4QPO35hjCsV4H7QIAC4RY";
+
+        const statusEl = document.getElementById("status");
+        const cardBtn = document.getElementById("cardBtn");
+        const achBtn = document.getElementById("achBtn");
+
+        if (!token) {
+            statusEl.innerText = "User not logged in";
+            cardBtn.disabled = true;
+            achBtn.disabled = true;
+        }
+
+        /* ============================================
+           CREATE SESSION FUNCTION
+        ============================================ */
+        async function createSession(type) {
+            statusEl.innerText = "Creating payment session...";
+            cardBtn.disabled = true;
+            achBtn.disabled = true;
+
+            const endpoint =
+                type === "card"
+                    ? "/api/diocese/parish/create-card-session"
+                    : "/api/diocese/parish/create-ach-session";
+
+            try {
+                const response = await fetch(BASE_URL + endpoint, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json",
+                        "Authorization": "Bearer " + token
+                    },
+                    body: JSON.stringify({
+                        planId: PLAN_ID,
+                        successUrl: window.location.origin + window.location.pathname,
+                        cancelUrl: window.location.origin + window.location.pathname
+                    })
+                });
+
+                const data = await response.json();
+                console.log("Session response:", data);
+
+                if (data.success && data.data.url) {
+                    window.location.href = data.data.url;
+                } else {
+                    statusEl.innerText = data.message || "Failed to create session";
+                    cardBtn.disabled = false;
+                    achBtn.disabled = false;
+                }
+
+            } catch (err) {
+                console.error(err);
+                statusEl.innerText = "Server connection error";
+                cardBtn.disabled = false;
+                achBtn.disabled = false;
+            }
+        }
+
+        cardBtn.addEventListener("click", () => createSession("card"));
+        achBtn.addEventListener("click", () => createSession("ach"));
+
+        /* ============================================
+           VERIFY AFTER STRIPE REDIRECT
+           ✅ FIX 1: POST  → GET
+           ✅ FIX 2: body  → URL params mein sessionId
+           ✅ FIX 3: URL mein :sessionId literal nahi, actual value daalo
+           ✅ FIX 4: ACH "processing" state handle karo
+        ============================================ */
+        const params = new URLSearchParams(window.location.search);
+        const sessionId = params.get("session_id");
+
+        async function verifyPayment(sessionId) {
+            statusEl.innerText = "Verifying payment...";
+
+            try {
+                // ✅ FIX: GET request — sessionId URL mein jaata hai, body nahi
+                const response = await fetch(
+                    `${BASE_URL}/api/diocese/parish/verify-payment/${sessionId}`,
+                    {
+                        method: "GET",
+                        headers: {
+                            "Authorization": "Bearer " + token
+                        }
+                        // ✅ GET mein body nahi hoti — remove kiya
+                    }
+                );
+
+                const data = await response.json();
+                console.log("Verify response:", data);
+
+                if (data.success) {
+                    // ✅ FIX: ACH "processing" alag message dikhao
+                    if (data.data?.status === "processing") {
+                        statusEl.innerHTML = `
+                            <strong style="color:orange;">
+                                ACH Payment Processing...
+                            </strong><br><br>
+                            Bank ne payment accept kar li hai.<br>
+                            3–5 banking days mein plan activate ho jayega.
+                        `;
+                        cardBtn.style.display = "none";
+                        achBtn.style.display = "none";
+                    } else {
+                        statusEl.innerHTML = `
+                            <strong style="color:green;">
+                                Payment Successful!
+                            </strong><br><br>
+                            Parish plan is now ACTIVE.
+                        `;
+                        cardBtn.style.display = "none";
+                        achBtn.style.display = "none";
+                    }
+                } else {
+                    statusEl.innerText = data.message || "Verification failed";
+                    cardBtn.disabled = false;
+                    achBtn.disabled = false;
+                }
+
+            } catch (err) {
+                console.error(err);
+                statusEl.innerText = "Verification error";
+            }
+        }
+
+        if (sessionId) {
+            verifyPayment(sessionId);
+        }
+
+    </script>
+
+</body>
+
+</html>

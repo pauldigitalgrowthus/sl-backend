@@ -1,0 +1,329 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<title>Course Learn API Tester</title>
+<style>
+    body { font-family: Arial, sans-serif; max-width: 900px; margin: 20px auto; padding: 0 15px; }
+    fieldset { margin-bottom: 20px; padding: 10px; }
+    input, button, textarea, select { padding: 6px; margin: 3px 0; }
+    input[type=text] { width: 260px; }
+    button { cursor: pointer; }
+    .chapter { border: 1px solid #999; margin: 10px 0; padding: 10px; }
+    .lesson { border: 1px solid #ccc; margin: 8px 0; padding: 8px; }
+    .lesson.completed { background: #e6ffe6; }
+    .quiz-box { border: 1px dashed #666; margin-top: 6px; padding: 8px; }
+    .question { border-bottom: 1px solid #ddd; padding: 8px 0; }
+    .error { color: red; font-weight: bold; }
+    .success { color: green; font-weight: bold; }
+    pre { background: #f4f4f4; padding: 8px; overflow-x: auto; }
+    .muted { color: #666; font-size: 0.9em; }
+</style>
+</head>
+<body>
+
+<h1>Course Learn API Tester</h1>
+
+<fieldset>
+    <legend>Config</legend>
+    <div>
+        API Base: <input type="text" id="apiBase" value="/api/educator/learn" />
+    </div>
+    <div>
+        Auth Token (Bearer): <input type="text" id="authToken" placeholder="paste JWT here" />
+    </div>
+    <div>
+        Course ID: <input type="text" id="courseId" placeholder="e.g. 12" />
+        <button onclick="loadCourse()">Load Course</button>
+        <button onclick="loadReport()">Load Report</button>
+    </div>
+    <div id="statusMsg"></div>
+</fieldset>
+
+<div id="courseInfo"></div>
+
+<div id="chaptersContainer"></div>
+
+<fieldset>
+    <legend>Final / Course-level Quiz</legend>
+    <div id="finalQuizContainer" class="muted">Load a course first.</div>
+</fieldset>
+
+<fieldset>
+    <legend>Quiz Player</legend>
+    <div id="quizPlayer" class="muted">No quiz open.</div>
+</fieldset>
+
+<fieldset>
+    <legend>Report</legend>
+    <div id="reportContainer" class="muted">Not loaded.</div>
+</fieldset>
+
+<script>
+    let currentCourseId = null;
+    let currentQuizId = null;
+    let currentQuestions = [];
+
+    function apiBase() { return document.getElementById("apiBase").value.replace(/\/$/, ""); }
+    function token() { return document.getElementById("authToken").value.trim(); }
+
+    function setStatus(msg, isError) {
+        const el = document.getElementById("statusMsg");
+        el.textContent = msg;
+        el.className = isError ? "error" : "success";
+    }
+
+    async function api(path, options = {}) {
+        const res = await fetch(apiBase() + path, {
+            ...options,
+            headers: {
+                "Content-Type": "application/json",
+                "Authorization": "Bearer " + token(),
+                ...(options.headers || {})
+            },
+            body: options.body ? JSON.stringify(options.body) : undefined
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+            throw new Error(data.message || ("Request failed: " + res.status));
+        }
+        return data;
+    }
+
+    /* ============================================================
+       LOAD COURSE  -> GET /:courseId
+    ============================================================ */
+    async function loadCourse() {
+        currentCourseId = document.getElementById("courseId").value.trim();
+        if (!currentCourseId) return setStatus("Enter a Course ID first", true);
+
+        try {
+            const res = await api("/" + currentCourseId);
+            setStatus("Course loaded", false);
+            renderCourse(res.data);
+        } catch (err) {
+            setStatus(err.message, true);
+        }
+    }
+
+    function renderCourse(data) {
+        const { course, enrollment, final_quiz, chapters, next_lesson_id } = data;
+
+        document.getElementById("courseInfo").innerHTML = `
+            <h2>${course.course_title}</h2>
+            <p>${course.short_description || ""}</p>
+            <p><b>Progress:</b> ${enrollment ? enrollment.progress_percentage : 0}%
+               ${enrollment && enrollment.completed ? " — <b class='success'>COURSE COMPLETED 🎉</b>" : ""}</p>
+            <p class="muted">Next lesson to do: ${next_lesson_id || "—"}</p>
+        `;
+
+        const container = document.getElementById("chaptersContainer");
+        container.innerHTML = "";
+
+        chapters.forEach((chapter) => {
+            const chapterDiv = document.createElement("div");
+            chapterDiv.className = "chapter";
+            chapterDiv.innerHTML = `<h3>${chapter.title} (${chapter.completed_lessons}/${chapter.total_lessons})</h3>`;
+
+            chapter.lessons.forEach((lesson) => {
+                const lessonDiv = document.createElement("div");
+                lessonDiv.className = "lesson" + (lesson.is_completed ? " completed" : "");
+
+                lessonDiv.innerHTML = `
+                    <b>${lesson.title}</b> <span class="muted">[${lesson.lesson_type}]</span>
+                    ${lesson.is_completed ? " ✅" : ""}
+                    <br/>
+                    <button onclick="completeLesson(${lesson.id})">Mark Complete</button>
+                    <button onclick="incompleteLesson(${lesson.id})">Mark Incomplete</button>
+                    ${lesson.quiz ? `
+                        <div class="quiz-box">
+                            Quiz: <b>${lesson.quiz.title}</b>
+                            — ${lesson.quiz.unlocked ? "Unlocked" : "🔒 Locked"}
+                            ${lesson.quiz.attempt ? ` — Last score: ${lesson.quiz.attempt.score_percentage ?? "-"}%` : ""}
+                            <br/>
+                            <button ${lesson.quiz.unlocked ? "" : "disabled"} onclick="openQuiz(${lesson.quiz.id})">Take Quiz</button>
+                            <button onclick="getResult(${lesson.quiz.id})">View Last Result</button>
+                        </div>
+                    ` : ""}
+                    ${lesson.resources.length ? `<div class="muted">Resources: ${lesson.resources.map(r => `<a href="${r.file_url}" target="_blank">${r.file_name}</a>`).join(", ")}</div>` : ""}
+                `;
+                chapterDiv.appendChild(lessonDiv);
+            });
+
+            container.appendChild(chapterDiv);
+        });
+
+        const finalContainer = document.getElementById("finalQuizContainer");
+        if (final_quiz) {
+            finalContainer.innerHTML = `
+                <b>${final_quiz.title}</b> — ${final_quiz.unlocked ? "Unlocked" : "🔒 Locked"}
+                ${final_quiz.attempt ? ` — Last score: ${final_quiz.attempt.score_percentage ?? "-"}%` : ""}
+                <br/>
+                <button ${final_quiz.unlocked ? "" : "disabled"} onclick="openQuiz(${final_quiz.id})">Take Final Quiz</button>
+                <button onclick="getResult(${final_quiz.id})">View Last Result</button>
+            `;
+        } else {
+            finalContainer.innerHTML = "<span class='muted'>No course-level quiz for this course.</span>";
+        }
+    }
+
+    /* ============================================================
+       LESSON COMPLETE / INCOMPLETE
+    ============================================================ */
+    async function completeLesson(lessonId) {
+        try {
+            const res = await api(`/${currentCourseId}/lessons/${lessonId}/complete`, { method: "POST", body: {} });
+            setStatus(res.message, false);
+            loadCourse();
+        } catch (err) {
+            setStatus(err.message, true);
+        }
+    }
+
+    async function incompleteLesson(lessonId) {
+        try {
+            const res = await api(`/${currentCourseId}/lessons/${lessonId}/incomplete`, { method: "POST", body: {} });
+            setStatus(res.message, false);
+            loadCourse();
+        } catch (err) {
+            setStatus(err.message, true);
+        }
+    }
+
+    /* ============================================================
+       QUIZ FLOW: start -> answer -> save/submit -> result
+    ============================================================ */
+    async function openQuiz(quizId) {
+        currentQuizId = quizId;
+        try {
+            const res = await api(`/${currentCourseId}/quizzes/${quizId}/start`, { method: "POST", body: {} });
+            currentQuestions = res.data.questions;
+            renderQuizPlayer(res.data.answers_so_far || {});
+            setStatus(res.message, false);
+        } catch (err) {
+            setStatus(err.message, true);
+        }
+    }
+
+    function renderQuizPlayer(answersSoFar) {
+        const player = document.getElementById("quizPlayer");
+        player.innerHTML = `<h3>Quiz #${currentQuizId}</h3>`;
+
+        currentQuestions.forEach((q, idx) => {
+            const qDiv = document.createElement("div");
+            qDiv.className = "question";
+            let inputHtml = "";
+
+            const saved = answersSoFar[q.id];
+
+            if (q.question_type === "mcq_single" || q.question_type === "true_false") {
+                const opts = q.question_type === "true_false" ? ["True", "False"] : q.options;
+                inputHtml = opts.map((opt, i) => `
+                    <label><input type="radio" name="q_${q.id}" value="${i}" ${saved == i ? "checked" : ""}/> ${opt}</label><br/>
+                `).join("");
+            } else if (q.question_type === "mcq_multiple") {
+                inputHtml = q.options.map((opt, i) => `
+                    <label><input type="checkbox" name="q_${q.id}" value="${i}" ${Array.isArray(saved) && saved.includes(i) ? "checked" : ""}/> ${opt}</label><br/>
+                `).join("");
+            } else if (q.question_type === "fill_blank") {
+                inputHtml = `<input type="text" name="q_${q.id}" value="${saved || ""}" placeholder="Your answer" />`;
+            } else {
+                // matching / ordering -> raw JSON input, kept simple
+                inputHtml = `<textarea name="q_${q.id}" rows="2" placeholder='e.g. [0,1,2] or [[0,1],[1,0]]'>${saved ? JSON.stringify(saved) : ""}</textarea>`;
+            }
+
+            qDiv.innerHTML = `<b>Q${idx + 1}. ${q.question_text}</b> <span class="muted">[${q.question_type}]</span><br/>${inputHtml}`;
+            player.appendChild(qDiv);
+        });
+
+        const actions = document.createElement("div");
+        actions.innerHTML = `
+            <button onclick="saveQuizProgress()">Save Progress</button>
+            <button onclick="submitQuiz()">Submit Quiz</button>
+        `;
+        player.appendChild(actions);
+        player.appendChild(document.createElement("div")).id = "quizResultBox";
+    }
+
+    function collectAnswers() {
+        const answers = {};
+        currentQuestions.forEach((q) => {
+            const inputs = document.getElementsByName(`q_${q.id}`);
+            if (!inputs.length) return;
+
+            if (q.question_type === "mcq_single" || q.question_type === "true_false") {
+                const checked = Array.from(inputs).find((i) => i.checked);
+                if (checked) answers[q.id] = Number(checked.value);
+            } else if (q.question_type === "mcq_multiple") {
+                const checked = Array.from(inputs).filter((i) => i.checked).map((i) => Number(i.value));
+                if (checked.length) answers[q.id] = checked;
+            } else if (q.question_type === "fill_blank") {
+                if (inputs[0].value) answers[q.id] = inputs[0].value;
+            } else {
+                try {
+                    if (inputs[0].value) answers[q.id] = JSON.parse(inputs[0].value);
+                } catch { /* ignore invalid JSON until fixed */ }
+            }
+        });
+        return answers;
+    }
+
+    async function saveQuizProgress() {
+        try {
+            const res = await api(`/${currentCourseId}/quizzes/${currentQuizId}/save`, {
+                method: "PUT",
+                body: { answers: collectAnswers() }
+            });
+            setStatus(res.message, false);
+        } catch (err) {
+            setStatus(err.message, true);
+        }
+    }
+
+    async function submitQuiz() {
+        try {
+            const res = await api(`/${currentCourseId}/quizzes/${currentQuizId}/submit`, {
+                method: "POST",
+                body: { answers: collectAnswers() }
+            });
+            setStatus(res.message, false);
+            document.getElementById("quizResultBox").innerHTML = `
+                <pre>${JSON.stringify(res.data, null, 2)}</pre>
+            `;
+            loadCourse();
+        } catch (err) {
+            setStatus(err.message, true);
+        }
+    }
+
+    async function getResult(quizId) {
+        try {
+            const res = await api(`/${currentCourseId}/quizzes/${quizId}/result`);
+            document.getElementById("quizPlayer").innerHTML = `
+                <h3>Last Result — Quiz #${quizId}</h3>
+                <pre>${JSON.stringify(res.data, null, 2)}</pre>
+            `;
+        } catch (err) {
+            setStatus(err.message, true);
+        }
+    }
+
+    /* ============================================================
+       REPORT
+    ============================================================ */
+    async function loadReport() {
+        const courseId = document.getElementById("courseId").value.trim();
+        if (!courseId) return setStatus("Enter a Course ID first", true);
+
+        try {
+            const res = await api(`/${courseId}/report`);
+            document.getElementById("reportContainer").innerHTML = `<pre>${JSON.stringify(res.data, null, 2)}</pre>`;
+            setStatus(res.message, false);
+        } catch (err) {
+            setStatus(err.message, true);
+        }
+    }
+</script>
+
+</body>
+</html>

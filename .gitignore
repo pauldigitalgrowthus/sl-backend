@@ -1,0 +1,8 @@
+node_modules/
+config/.env
+test.js
+exports
+.env
+.env*
+*.log
+.DS_Store
