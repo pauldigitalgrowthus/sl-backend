@@ -1,4 +1,5 @@
 const mysql = require('mysql2/promise');
+const { initQuickbooksTables } = require('./quickbooks-db');
 
 let mysqlConnection = null;
 
@@ -167,6 +168,7 @@ const initializeTables = async () => {
     await createPasswordResetOtpsTable();
     await createSubscriptionsTable();
     await createUserSubscriptionsTable();
+    await createSubscriptionExpiryRemindersTable();
     await createFiltersTable();
     await createSmallFiltersTable();
     await createTypeOfMusicTable();
@@ -205,6 +207,11 @@ const initializeTables = async () => {
     await createComposerEarningTable();
     await createEducatorTables();
     coursetTable();
+    await createRoyaltyTables();
+    await initQuickbooksTables(mysqlConnection);
+    await seedRoyaltyDeductionEntities();
+    await createCommunityPortalTables();
+    await createSystemConfigurationsTable();
 
     // Seed default data
     await insertDefaultSubscriptions();
@@ -311,7 +318,8 @@ const createUsersTable = async () => {
       { name: 'user_type', alter: "MODIFY COLUMN user_type ENUM('admin', 'sub_user', 'superadmin', 'manager') DEFAULT 'admin'", action: 'modify' },
       { name: 'publisherName', alter: "ADD COLUMN publisherName VARCHAR(200) NULL AFTER full_name", action: 'add' },
       { name: 'useFullNameAsPublisher', alter: "ADD COLUMN useFullNameAsPublisher BOOLEAN DEFAULT FALSE", action: 'add' },
-      { name: 'is_diocesan', alter: "ADD COLUMN is_diocesan BOOLEAN DEFAULT FALSE", action: 'add' }
+      { name: 'is_diocesan', alter: "ADD COLUMN is_diocesan BOOLEAN DEFAULT FALSE", action: 'add' },
+      { name: 'is_educator', alter: "ADD COLUMN is_educator BOOLEAN DEFAULT FALSE AFTER is_composer", action: 'add' }
 
     ]);
 
@@ -497,6 +505,45 @@ const createUserSubscriptionsTable = async () => {
   } catch (error) {
     await mysqlConnection.execute(createTableSQL);
     console.log('✅ User subscriptions table created');
+  }
+};
+
+// ============================================
+// TABLE 5b: SUBSCRIPTION EXPIRY REMINDER LOGS
+// ------------------------------------------------------------
+// Tracks every expiry-related email sent by the subscription
+// cron job (utils/subscriptionCronJobs.js) — WHO got emailed,
+// WHICH reminder (30_day / 7_day / expired), and WHEN.
+// UNIQUE(subscription_id, reminder_type) doubles as the
+// de-dupe guard so the same reminder is never sent twice for
+// the same subscription.
+// ============================================
+const createSubscriptionExpiryRemindersTable = async () => {
+  const createTableSQL = `
+    CREATE TABLE IF NOT EXISTS subscription_expiry_reminders (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      subscription_id INT NOT NULL,
+      user_id INT NOT NULL,
+      email VARCHAR(150) NULL,
+      plan_name VARCHAR(150) NULL,
+      reminder_type ENUM('30_day', '7_day', 'expired') NOT NULL,
+      status ENUM('sent', 'failed') DEFAULT 'sent',
+      error_message TEXT NULL,
+      sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      UNIQUE KEY uniq_subscription_reminder (subscription_id, reminder_type),
+      INDEX idx_user_id (user_id),
+      INDEX idx_reminder_type (reminder_type),
+      INDEX idx_sent_at (sent_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `;
+
+  try {
+    await mysqlConnection.execute('SELECT 1 FROM subscription_expiry_reminders LIMIT 1');
+    console.log('✅ Subscription expiry reminders table already exists');
+  } catch (error) {
+    await mysqlConnection.execute(createTableSQL);
+    console.log('✅ Subscription expiry reminders table created');
   }
 };
 
@@ -920,6 +967,11 @@ const createMusicPublicationsTable = async () => {
       
       -- Deletion Scheduling
       scheduled_deletion_at DATETIME NULL,
+
+      -- Contract HTML Template Details
+      ContractHTMLJSON JSON NULL,
+      adminContractHTML LONGTEXT NULL,
+      composerContractHTML LONGTEXT NULL,
       
       -- Timestamps
       created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
@@ -992,7 +1044,10 @@ const createMusicPublicationsTable = async () => {
       { name: 'liturgicalSacrament', alter: 'ADD COLUMN liturgicalSacrament VARCHAR(100) NULL AFTER partsofmass' },
       { name: 'toggle', alter: "ADD COLUMN toggle ENUM('active','inactive') NOT NULL DEFAULT 'inactive'" },
       { name: 'stage2_history', alter: 'ADD COLUMN stage2_history JSON NULL AFTER stage2_replaced_files' },
-      { name: 'stage3_history', alter: 'ADD COLUMN stage3_history JSON NULL AFTER stage3_replaced_files' }
+      { name: 'stage3_history', alter: 'ADD COLUMN stage3_history JSON NULL AFTER stage3_replaced_files' },
+      { name: 'ContractHTMLJSON', alter: 'ADD COLUMN ContractHTMLJSON JSON NULL' },
+      { name: 'adminContractHTML', alter: 'ADD COLUMN adminContractHTML LONGTEXT NULL' },
+      { name: 'composerContractHTML', alter: 'ADD COLUMN composerContractHTML LONGTEXT NULL' }
 
     ]);
     console.log('✅ Music publications table already exists');
@@ -1590,6 +1645,13 @@ const createPermissionTables = async () => {
     await mysqlConnection.execute(createPermissionsTable);
     await mysqlConnection.execute(createRolePermissionsTable);
     await mysqlConnection.execute(createUserPermissionsTable);
+    // 🏷️ ActiveCampaign tag ID tracking (added later — migrate existing tables)
+    await ensureTableColumns(mysqlConnection, 'plans', [
+      { name: 'ac_tag_id', alter: 'ADD COLUMN ac_tag_id INT NULL AFTER is_active' }
+    ]);
+    await ensureTableColumns(mysqlConnection, 'role_permissions', [
+      { name: 'ac_tag_id', alter: 'ADD COLUMN ac_tag_id INT NULL AFTER permissions' }
+    ]);
     console.log('✅ Permission management tables created');
   } catch (error) {
     console.error('❌ Failed to create permission tables:', error);
@@ -1977,7 +2039,7 @@ const createPaymentTables = async () => {
 // TABLE 38: MUSIC TRANSACTIONS
 // ============================================
 const createMusicTransactionsTable = async () => {
-  const createTableSQL = `CREATE TABLE music_transactions (
+  const createTableSQL = `CREATE TABLE IF NOT EXISTS music_transactions (
     id INT AUTO_INCREMENT PRIMARY KEY,
     user_id INT NOT NULL,
     stripe_session_id VARCHAR(255) UNIQUE,
@@ -2389,6 +2451,60 @@ const createPlannerTables = async () => {
   );
 `;
 
+  const createPlannerMasspartsTableSQL = `
+    CREATE TABLE IF NOT EXISTS planner_massparts (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(255) NOT NULL,
+      full_path JSON NOT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;  
+  `;
+
+  const createMassTemplatesTable = `
+    CREATE TABLE IF NOT EXISTS planner_mass_templates (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+ 
+      -- 'direct' | 'wedding' | 'funeral' | 'other' (frontend category keys)
+      category VARCHAR(50) NOT NULL,
+ 
+      -- 'sunday' | 'weekday' | 'matrimony-during' | etc (frontend id)
+      template_key VARCHAR(100) NOT NULL,
+ 
+      -- Display name e.g. "Sunday Mass"
+      name VARCHAR(255) NOT NULL,
+ 
+      -- Poora { mass_template_data: { sections: [...] } } object JSON me
+      template_data JSON NOT NULL,
+ 
+      -- Category ke andar order maintain karne ke liye
+      display_order INT DEFAULT 0,
+ 
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+ 
+      UNIQUE KEY uniq_category_key (category, template_key),
+      INDEX idx_category (category)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `;
+
+  const createMassTemplateCategorysTableSQL = `
+    CREATE TABLE IF NOT EXISTS planner_mass_template_categories (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+
+      -- e.g. 'direct', 'wedding', 'funeral', 'other', ya koi bhi naya jo admin add kare
+      category_key VARCHAR(50) NOT NULL UNIQUE,
+
+      -- Display label e.g. "Wedding Mass"
+      label VARCHAR(255) NOT NULL,
+
+      -- Categories ka order
+      display_order INT DEFAULT 0,
+
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `
+
   try {
     await mysqlConnection.execute(createPlannersTableSQL);
     await ensureTableColumns(mysqlConnection, 'planners', [
@@ -2407,6 +2523,9 @@ const createPlannerTables = async () => {
     await mysqlConnection.execute(createPlannerGroupsTableSQL);
     await mysqlConnection.execute(createPlannerGroupMembersTableSQL);
     await mysqlConnection.execute(createMassSheduleTableSQL);
+    await mysqlConnection.execute(createMassTemplateCategorysTableSQL);
+    await mysqlConnection.execute(createPlannerMasspartsTableSQL);
+    await mysqlConnection.execute(createMassTemplatesTable);
     // Seed default planner massparts if empty
     await seedPlannerMassparts();
 
@@ -2599,6 +2718,9 @@ const createLiturgicalEventsTable = async () => {
     await ensureTableColumns(mysqlConnection, 'liturgical_events', [{
       name: 'liturgical_songs',
       alter: 'ADD COLUMN liturgical_songs JSON NULL'
+    }, {
+      name: 'attached_mass_template',
+      alter: 'ADD COLUMN attached_mass_template JSON NULL'
     }]);
     console.log('✅ Liturgical Events table already exists');
 
@@ -2633,7 +2755,7 @@ const createHymnalMusicLibraryTable = async () => {
   `;
 
   const createHymnalMusicLibraryTableSQL = `
-    CREATE TABLE hymnal_music_library (
+    CREATE TABLE IF NOT EXISTS hymnal_music_library (
       id INT NOT NULL AUTO_INCREMENT,
       user_id INT NOT NULL,    
       -- multi category support
@@ -2703,7 +2825,8 @@ const createHymnalMusicLibraryTable = async () => {
       { name: "hymnal_solo_instruments", alter: 'ADD COLUMN hymnal_solo_instruments JSON NULL' },
       { name: "hymnal_choral_settings", alter: 'ADD COLUMN hymnal_choral_settings JSON NULL' },
       { name: "hymnal_source_page", alter: 'ADD COLUMN hymnal_source_page VARCHAR(100) NULL' },
-      { name: "added_to_users", alter: 'ADD COLUMN added_to_users JSON NULL' }
+      { name: "added_to_users", alter: 'ADD COLUMN added_to_users JSON NULL' },
+      { name: "user_personal_music", alter: 'ADD COLUMN user_personal_music JSON NULL' }
     ])
 
 
@@ -3182,6 +3305,27 @@ const createComposerEarningTable = async () => {
 
   try {
     await mysqlConnection.execute('SELECT 1 FROM composer_earnings LIMIT 1');
+    await ensureTableColumns(mysqlConnection, 'composer_earnings', [
+      { name: 'payment_reference', alter: "ADD COLUMN payment_reference VARCHAR(255) NULL AFTER payment_method" },
+      { name: 'source_type', alter: "ADD COLUMN source_type ENUM('a_la_carte','subscription','one_license') DEFAULT 'a_la_carte'" },
+      { name: 'total_deductions', alter: "ADD COLUMN total_deductions DECIMAL(10,2) DEFAULT 0.00" },
+      { name: 'net_after_deductions', alter: "ADD COLUMN net_after_deductions DECIMAL(10,2) DEFAULT 0.00" },
+      { name: 'royalty_percent', alter: "ADD COLUMN royalty_percent DECIMAL(5,2) DEFAULT 30.00" },
+      { name: 'usage_share_percent', alter: "ADD COLUMN usage_share_percent DECIMAL(8,4) NULL" },
+      { name: 'pay_period', alter: "ADD COLUMN pay_period VARCHAR(20) NULL" },
+      { name: 'one_license_record_id', alter: "ADD COLUMN one_license_record_id INT NULL" }
+    ]);
+
+    // Widen precision-sensitive columns so full-precision ONE LICENSE
+    // values (e.g. $1.983737) are never silently truncated before the
+    // royalty calculation completes - client spec, Aug 2026. Only the
+    // FINAL composer_earning is rounded to cents by the application code.
+    await mysqlConnection.execute(`
+      ALTER TABLE composer_earnings
+      MODIFY COLUMN sale_price DECIMAL(14,6) NOT NULL DEFAULT 0.00,
+      MODIFY COLUMN total_deductions DECIMAL(14,6) DEFAULT 0.00,
+      MODIFY COLUMN net_after_deductions DECIMAL(14,6) DEFAULT 0.00
+    `).catch((err) => console.log('ℹ️ composer_earnings precision ALTER skipped:', err.message));
     console.log('Composer Earning table already exists');
   } catch (error) {
     await mysqlConnection.execute(createTable);
@@ -3269,7 +3413,7 @@ const createEducatorTables = async () => {
 
   try {
     await mysqlConnection.execute('SELECT 1 FROM educator_tools LIMIT 1');
-    await mysqlConnection.execute('SELECT 1 FROM educators_applications LIMIT 1');
+    await mysqlConnection.execute('SELECT 1 FROM educator_applications LIMIT 1');
     console.log('Educator Tools table already exists');
     console.log('Educator Application table already exists');
 
@@ -3286,7 +3430,7 @@ const createEducatorTables = async () => {
 // COURSES TABLE
 // ============================================
 
-const coursetTable = async = () => {
+const coursetTable = async () => {
   const createCoursesTables = async () => {
     const sql = `
     CREATE TABLE IF NOT EXISTS courses (
@@ -3378,8 +3522,12 @@ const coursetTable = async = () => {
         {
           name: 'status',
           action: 'modify',
-          alter: "MODIFY COLUMN status ENUM('proposal_submitted','proposal_rejected','draft','in_development','submitted_for_review','revision_requested','approved','published','rejected','archived') DEFAULT 'draft'"
+          alter: "MODIFY COLUMN status ENUM('proposal_submitted','proposal_rejected','draft','in_development','submitted_for_review','revision_requested','approved','published','rejected','archived','unpublished') DEFAULT 'draft'"
         },
+        { name: 'course_review_comments', alter: "ADD COLUMN course_review_comments JSON" },
+        { name: 'is_archive', alter: "ADD COLUMN is_archive BOOLEAN DEFAULT FALSE" },
+        { name: 'is_created_by_admin', alter: "ADD COLUMN is_created_by_admin BOOLEAN DEFAULT FALSE" }
+
       ]);
     } catch {
       await mysqlConnection.execute(sql);
@@ -3448,6 +3596,8 @@ const coursetTable = async = () => {
 
     try {
       await mysqlConnection.execute('SELECT 1 FROM course_lessons LIMIT 1');
+      try { await mysqlConnection.execute('ALTER TABLE course_lessons ADD COLUMN link_url VARCHAR(500) NULL AFTER video_url'); } catch (e) { }
+      try { await mysqlConnection.execute('ALTER TABLE course_lessons ADD COLUMN link_title VARCHAR(255) NULL AFTER link_url'); } catch (e) { }
       console.log('✅ course_lessons table already exists');
     } catch {
       await mysqlConnection.execute(sql);
@@ -3613,6 +3763,46 @@ const coursetTable = async = () => {
 
 
   // ============================================
+  // COURSE TRANSACTIONS TABLE (Stripe payment log)
+  // ============================================
+  const createCourseTransactionsTable = async () => {
+    const sql = `
+    CREATE TABLE IF NOT EXISTS course_transactions (
+      id                        INT AUTO_INCREMENT PRIMARY KEY,
+      course_id                 INT NOT NULL,
+      student_id                INT NOT NULL,
+      stripe_session_id         VARCHAR(255) NULL,
+      stripe_payment_intent_id  VARCHAR(255) NULL,
+      stripe_customer_id        VARCHAR(255) NULL,
+      amount                    DECIMAL(10,2) NOT NULL,
+      currency                  VARCHAR(10)  DEFAULT 'usd',
+      status                    ENUM('pending','completed','failed','refunded','cancelled') DEFAULT 'pending',
+      payment_method_types      JSON NULL,
+      failure_message           TEXT NULL,
+      completed_at              TIMESTAMP NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP, 
+      INDEX idx_course   (course_id),
+      INDEX idx_student  (student_id),
+      INDEX idx_session  (stripe_session_id),
+      INDEX idx_status   (status),
+      UNIQUE KEY uq_stripe_session (stripe_session_id),
+      FOREIGN KEY (course_id)  REFERENCES courses(id) ON DELETE CASCADE,
+      FOREIGN KEY (student_id) REFERENCES users(id)   ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `;
+
+    try {
+      await mysqlConnection.execute('SELECT 1 FROM course_transactions LIMIT 1');
+      console.log('✅ course_transactions table already exists');
+    } catch {
+      await mysqlConnection.execute(sql);
+      console.log('✅ course_transactions table created');
+    }
+  };
+
+
+  // ============================================
   // LESSON PROGRESS TABLE
   // ============================================
   const createLessonProgressTable = async () => {
@@ -3688,7 +3878,7 @@ const coursetTable = async = () => {
         FOREIGN KEY (created_by) REFERENCES users(id)          ON DELETE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `;
-  
+
     try {
       await mysqlConnection.execute('SELECT 1 FROM quizzes LIMIT 1');
       console.log('✅ quizzes table already exists');
@@ -3697,7 +3887,7 @@ const coursetTable = async = () => {
       console.log('✅ quizzes table created');
     }
   };
-  
+
   const createQuizQuestionsTable = async () => {
     const sql = `
       CREATE TABLE IF NOT EXISTS quiz_questions (
@@ -3729,7 +3919,7 @@ const coursetTable = async = () => {
         FOREIGN KEY (quiz_id) REFERENCES quizzes(id) ON DELETE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `;
-  
+
     try {
       await mysqlConnection.execute('SELECT 1 FROM quiz_questions LIMIT 1');
       console.log('✅ quiz_questions table already exists');
@@ -3738,7 +3928,7 @@ const coursetTable = async = () => {
       console.log('✅ quiz_questions table created');
     }
   };
-  
+
   const createQuizAttemptsTable = async () => {
     const sql = `
       CREATE TABLE IF NOT EXISTS quiz_attempts (
@@ -3770,7 +3960,7 @@ const coursetTable = async = () => {
         FOREIGN KEY (student_id) REFERENCES users(id)   ON DELETE CASCADE
       ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
     `;
-  
+
     try {
       await mysqlConnection.execute('SELECT 1 FROM quiz_attempts LIMIT 1');
       console.log('✅ quiz_attempts table already exists');
@@ -3780,18 +3970,343 @@ const coursetTable = async = () => {
     }
   };
 
-  createCoursesTables();
-  createCourseChaptersTable();
-  createCourseLessonsTable();
-  createCourseReviewLogsTable();
-  createCourseStatusHistoryTable();
-  createCourseResourcesTable();
-  createCourseEnrollmentsTable();
-  createCoursePurchasesTable();
-  createLessonProgressTable();
-  createQuizzesTable();
-  createQuizQuestionsTable();
-  createQuizAttemptsTable(); 
+  // ============================================
+  // COURSE CART TABLE
+  // ============================================
+  const createCourseCartTable = async () => {
+    const sql = `
+    CREATE TABLE IF NOT EXISTS course_cart (
+      id         INT AUTO_INCREMENT PRIMARY KEY,
+      student_id INT NOT NULL,
+      course_id  INT NOT NULL,
+      added_at   TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      INDEX idx_student (student_id),
+      INDEX idx_course  (course_id),
+      UNIQUE KEY uq_student_course (student_id, course_id),
+      FOREIGN KEY (course_id)  REFERENCES courses(id) ON DELETE CASCADE,
+      FOREIGN KEY (student_id) REFERENCES users(id)   ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `;
+
+    try {
+      await mysqlConnection.execute('SELECT 1 FROM course_cart LIMIT 1');
+      console.log('✅ course_cart table already exists');
+    } catch {
+      await mysqlConnection.execute(sql);
+      console.log('✅ course_cart table created');
+    }
+  };
+
+  const createCourseDraftsTable = async () => {
+    const sql = `
+      CREATE TABLE IF NOT EXISTS course_drafts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        user_id INT NOT NULL,
+        draft_data LONGTEXT NOT NULL,
+        saved_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,  
+        INDEX idx_course (user_id),  
+        CONSTRAINT fk_course_drafts_user FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE )
+        ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `;
+
+    try {
+      await mysqlConnection.execute(sql);
+      console.log("✅ Course Drafts table created/already exists");
+    } catch (error) {
+      console.error("❌ Error creating Course Drafts table:", error.message);
+    }
+  };
+
+  const createCourseMasterDataTable = async () => {
+    const sql = `
+    CREATE TABLE IF NOT EXISTS course_master_data (
+      id INT AUTO_INCREMENT PRIMARY KEY,  
+      type ENUM('areas_of_expertise','target_audience','tools') NOT NULL,  
+      title VARCHAR(255) NOT NULL,
+      icon VARCHAR(500) DEFAULT NULL,  
+      sort_order INT NOT NULL DEFAULT 0,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,  
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,  
+      UNIQUE KEY uq_type_title (type, title),  
+      INDEX idx_type (type),
+      INDEX idx_active (is_active),
+      INDEX idx_sort (sort_order)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `;
+
+    try {
+      await mysqlConnection.execute(sql);
+      console.log("✅ Course Master Data table created/already exists");
+    } catch (error) {
+      console.error("❌ Error creating Course Master Data table:", error.message);
+    }
+  };
+
+
+  // ============================================
+  // CART CHECKOUT SESSIONS TABLE
+  // (one Stripe session can cover several courses at once,
+  //  so this is separate from course_transactions which is
+  //  logged per-course - see educator-cart.js)
+  // ============================================
+  const createCartCheckoutSessionsTable = async () => {
+    const sql = `
+    CREATE TABLE IF NOT EXISTS cart_checkout_sessions (
+      id                INT AUTO_INCREMENT PRIMARY KEY,
+      stripe_session_id VARCHAR(255) NOT NULL,
+      student_id        INT NOT NULL,
+      course_ids        JSON NOT NULL,
+      amount            DECIMAL(10,2),
+      currency          VARCHAR(10) DEFAULT 'usd',
+      status            ENUM('pending','completed','failed','refunded','cancelled') DEFAULT 'pending',
+      created_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at        TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      INDEX idx_student (student_id),
+      INDEX idx_status  (status),
+      UNIQUE KEY uq_stripe_session (stripe_session_id),
+      FOREIGN KEY (student_id) REFERENCES users(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `;
+
+    try {
+      await mysqlConnection.execute('SELECT 1 FROM cart_checkout_sessions LIMIT 1');
+      console.log('✅ cart_checkout_sessions table already exists');
+    } catch {
+      await mysqlConnection.execute(sql);
+      console.log('✅ cart_checkout_sessions table created');
+    }
+  };
+
+
+  const createCourseFilterTable = async () => {
+    const sql = `
+    CREATE TABLE IF NOT EXISTS course_filters (
+      id INT AUTO_INCREMENT PRIMARY KEY,  
+      label VARCHAR(255) NOT NULL,  
+      items JSON NOT NULL,
+      sort_order INT NOT NULL DEFAULT 0,
+      is_active BOOLEAN NOT NULL DEFAULT TRUE,  
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,  
+      UNIQUE KEY uq_label (label),  
+      INDEX idx_active (is_active),
+      INDEX idx_sort (sort_order)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+  `;
+    try {
+      await mysqlConnection.execute(sql);
+      console.log("✅ Course Master Data table created/already exists");
+    } catch (error) {
+      console.error("❌ Error creating Course Master Data table:", error.message);
+    }
+  }
+
+
+  // ============================================
+  // MIGRATION: allow multiple course_transactions rows
+  // per Stripe session (cart checkout = 1 session, N courses).
+  // Old schema had UNIQUE KEY uq_stripe_session (stripe_session_id)
+  // alone; that has to become a composite key with course_id so a
+  // cart session can log one row per purchased course.
+  // ============================================
+  const migrateCourseTransactionsForCart = async () => {
+    try {
+      const [indexRows] = await mysqlConnection.query(
+        `SHOW INDEX FROM course_transactions WHERE Key_name = 'uq_stripe_session'`
+      );
+
+      // If the old single-column unique key still exists, and it's
+      // only on stripe_session_id (not yet composite), replace it.
+      if (indexRows && indexRows.length === 1) {
+        console.log('⚠️ Migrating course_transactions unique key for cart support...');
+        await mysqlConnection.query(
+          `ALTER TABLE course_transactions DROP INDEX uq_stripe_session`
+        );
+        await mysqlConnection.query(
+          `ALTER TABLE course_transactions ADD UNIQUE KEY uq_session_course (stripe_session_id, course_id)`
+        );
+        console.log('✅ course_transactions unique key migrated to (stripe_session_id, course_id)');
+      } else {
+        console.log('✔️ course_transactions unique key already migrated or not found → skipping');
+      }
+    } catch (error) {
+      console.error('❌ Error migrating course_transactions unique key:', error);
+    }
+  };
+
+  const seedCourseMasterData = async () => {
+    const mysql = getMySQLConnection();
+
+    const seedData = [
+      // Areas of Expertise
+      { type: "areas_of_expertise", title: "Music Theory", sort_order: 1 },
+      { type: "areas_of_expertise", title: "Composition", sort_order: 2 },
+      { type: "areas_of_expertise", title: "Choir Conducting", sort_order: 3 },
+      { type: "areas_of_expertise", title: "Piano", sort_order: 4 },
+      { type: "areas_of_expertise", title: "Guitar", sort_order: 5 },
+      { type: "areas_of_expertise", title: "Vocal Training", sort_order: 6 },
+      { type: "areas_of_expertise", title: "Music Production", sort_order: 7 },
+
+      // Target Audience
+      { type: "target_audience", title: "Beginners", sort_order: 1 },
+      { type: "target_audience", title: "Intermediate", sort_order: 2 },
+      { type: "target_audience", title: "Advanced", sort_order: 3 },
+      { type: "target_audience", title: "Children", sort_order: 4 },
+      { type: "target_audience", title: "Adults", sort_order: 5 },
+      { type: "target_audience", title: "Church Musicians", sort_order: 6 },
+
+      // Tools
+      { type: "tools", title: "MuseScore", sort_order: 1 },
+      { type: "tools", title: "Finale", sort_order: 2 },
+      { type: "tools", title: "Sibelius", sort_order: 3 },
+      { type: "tools", title: "Logic Pro", sort_order: 4 },
+      { type: "tools", title: "GarageBand", sort_order: 5 },
+      { type: "tools", title: "FL Studio", sort_order: 6 },
+    ];
+
+    for (const item of seedData) {
+      const [[exists]] = await mysql.execute(
+        `
+            SELECT id
+            FROM course_master_data
+            WHERE type = ?
+              AND LOWER(title) = LOWER(?)
+            LIMIT 1
+            `,
+        [item.type, item.title]
+      );
+
+      if (exists) continue;
+
+      await mysql.execute(
+        `
+            INSERT INTO course_master_data
+            (
+                type,
+                title,
+                icon,
+                sort_order,
+                is_active
+            )
+            VALUES (?, ?, ?, ?, ?)
+            `,
+        [
+          item.type,
+          item.title,
+          null,
+          item.sort_order,
+          1,
+        ]
+      );
+    }
+
+    console.log("✅ Course master seed completed.");
+  };
+
+  const seedCourseFilters = async () => {
+    const mysql = getMySQLConnection();
+
+    const filters = [
+      {
+        label: "Difficulty",
+        items: [
+          "Beginner",
+          "Intermediate",
+          "Advanced"
+        ]
+      },
+      {
+        label: "Language",
+        items: [
+          "English",
+          "Hindi",
+          "Spanish",
+          "French"
+        ]
+      },
+      {
+        label: "Duration",
+        items: [
+          "0-2 Hours",
+          "2-5 Hours",
+          "5-10 Hours",
+          "10+ Hours"
+        ]
+      },
+      {
+        label: "Price",
+        items: [
+          "Free",
+          "Paid"
+        ]
+      },
+      {
+        label: "Rating",
+        items: [
+          "4★ & Above",
+          "4.5★ & Above",
+          "5★"
+        ]
+      }
+    ];
+
+    for (const filter of filters) {
+      const [[exists]] = await mysql.execute(
+        `
+            SELECT id
+            FROM course_filters
+            WHERE LOWER(label) = LOWER(?)
+            LIMIT 1
+            `,
+        [filter.label]
+      );
+
+      if (exists) continue;
+
+      await mysql.execute(
+        `
+            INSERT INTO course_filters
+            (
+                label,
+                items
+            )
+            VALUES (?, ?)
+            `,
+        [
+          filter.label,
+          JSON.stringify(filter.items)
+        ]
+      );
+    }
+
+    console.log("✅ Course filters seeded successfully.");
+  };
+
+
+  await createCoursesTables();
+  await createCourseChaptersTable();
+  await createCourseLessonsTable();
+  await createCourseReviewLogsTable();
+  await createCourseStatusHistoryTable();
+  await createCourseResourcesTable();
+  await createCourseEnrollmentsTable();
+  await createCoursePurchasesTable();
+  await createCourseTransactionsTable();
+  await migrateCourseTransactionsForCart();
+  await createCourseCartTable();
+  await createCartCheckoutSessionsTable();
+  await createLessonProgressTable();
+  await createQuizzesTable();
+  await createQuizQuestionsTable();
+  await createQuizAttemptsTable();
+  await createCourseDraftsTable();
+  await createCourseMasterDataTable();
+  await createCourseFilterTable();
+
+
+  await seedCourseMasterData();
+  await seedCourseFilters();
 
 }
 
@@ -3960,10 +4475,10 @@ const seedPermissionData = async () => {
     // 2. Seed Features
     const features = [
       // Community Category
-      // { name: 'Feed', slug: 'feed', category: 'Community', parent_id: null, display_order: 1 },
-      // { name: 'Discussions', slug: 'discussions', category: 'Community', parent_id: null, display_order: 2 },
-      // { name: 'My Groups', slug: 'my-groups', category: 'Community', parent_id: null, display_order: 3 },
-
+      { name: 'Feeds', slug: 'feed', category: 'Community', parent_id: null, display_order: 1 },
+      { name: 'Discussions', slug: 'discussions', category: 'Community', parent_id: null, display_order: 2 },
+      { name: 'My Groups', slug: 'my-groups', category: 'Community', parent_id: null, display_order: 3 },
+      { name: 'Prayer', slug: 'prayer-intentions', category: 'Community', parent_id: null, display_order: 4 },
       // Planner Category
       // { name: 'Plan a Service', slug: 'plan-a-service', category: 'Planner', parent_id: null, display_order: 1 },
       { name: 'My Planner', slug: 'my-planner', category: 'Planner', parent_id: null, display_order: 2 },
@@ -3974,12 +4489,12 @@ const seedPermissionData = async () => {
       // { name: 'My Documents', slug: 'my-documents', category: 'Documents', parent_id: null, display_order: 2 },
 
       // Music Category
-      { name: 'Browse SL Music', slug: 'browse-music', category: 'Music', parent_id: null, display_order: 1 },
+      { name: 'SL Music Catalog', slug: 'browse-music', category: 'Music', parent_id: null, display_order: 1 },
       { name: 'My Music', slug: 'my-music', category: 'Music', parent_id: null, display_order: 2 },
 
       // Academy Category
-      // { name: 'Browse Courses', slug: 'browse-courses', category: 'Academy', parent_id: null, display_order: 1 },
-      // { name: 'My Courses', slug: 'my-courses', category: 'Academy', parent_id: null, display_order: 2 },
+      { name: 'Browse Course', slug: 'browse-courses', category: 'Academy', parent_id: null, display_order: 1 },
+      { name: 'My Course', slug: 'my-courses', category: 'Academy', parent_id: null, display_order: 2 },
 
       // Composer Category
       { name: 'Browse SL Composers', slug: 'browse-composers', category: 'Composer', parent_id: null, display_order: 1 },
@@ -3991,12 +4506,12 @@ const seedPermissionData = async () => {
       // { name: 'Earnings', slug: 'composer-earnings', category: 'Composer', parent_id: null, display_order: 7 },
 
       // Educator Category
-      // { name: 'Browse Educators', slug: 'browse-educators', category: 'Educator', parent_id: null, display_order: 1 },
-      // { name: 'Educator Tools', slug: 'educator-tools', category: 'Educator', parent_id: null, display_order: 2 },
-      // { name: 'Educator Application', slug: 'educator-application', category: 'Educator', parent_id: null, display_order: 3 },
-      // { name: 'Publish a Course', slug: 'publish-course', category: 'Educator', parent_id: null, display_order: 4 },
-      // { name: 'Course Library', slug: 'course-library', category: 'Educator', parent_id: null, display_order: 5 },
-      // { name: 'Earnings', slug: 'course-earnings', category: 'Educator', parent_id: null, display_order: 6 },
+      { name: 'Browse Educators', slug: 'browse-educators', category: 'Educator', parent_id: null, display_order: 1 },
+      { name: 'Educator Tools', slug: 'educator-tools', category: 'Educator', parent_id: null, display_order: 2 },
+      { name: 'Educator Application', slug: 'educator-application', category: 'Educator', parent_id: null, display_order: 3 },
+      { name: 'Publish a Course', slug: 'publish-course', category: 'Educator', parent_id: null, display_order: 4 },
+      { name: 'Course Library', slug: 'course-library', category: 'Educator', parent_id: null, display_order: 5 },
+      { name: 'Earnings', slug: 'course-earnings', category: 'Educator', parent_id: null, display_order: 6 },
 
       // SL Account
       { name: 'My Profile', slug: 'my-profile', category: 'SL Account', parent_id: null, display_order: 1 },
@@ -4113,9 +4628,11 @@ const seedPermissionData = async () => {
 
 const defaultPermissions = {
   "SL Portals": {
-    "Dashboard": "-",
-
-
+    // "Community": {
+    //     "Feed": "-",
+    //     "Discussions": "-",
+    //     "My Groups": "-",
+    // },
     "Planner": {
       "My Planner": "-",
       // "My Ministers": "-",
@@ -4123,33 +4640,33 @@ const defaultPermissions = {
     },
     "Documents": {
       "Browse Documents": "-",
-      //   "My Documents": "-"
+      // "My Documents": "-"
     },
     "Music": {
       "Browse SL Music": "-",
       "My Music": "-"
     },
-    // "Academy": {
-    //   "Browse Courses": "-",
-    //   "My Courses": "-"
-    // },
+    "Academy": {
+      "Browse Courses": "-",
+      "My Courses": "-"
+    },
     "Composer": {
       "Browse SL Composers": "-",
       "Composer Tools": "-",
       "Publish a Composition": "-",
       "My Compositions": "-",
       "Composer Application": "-",
-      // "Review Board": "-",
-      // "Earnings": "-"
+      "Review Board Earnings": "-",
+      "Composer Earnings": "-"
     },
-    // "Educator": {
-    //   "Browse Educators": "-",
-    //   "Educator Tools": "-",
-    //   "Educator Application": "-",
-    //   "Teach a Course": "-",
-    //   "Course Library": "-",
-    //   "Earnings": "-"
-    // },
+    "Educator": {
+      "Browse Educators": "-",
+      "Educator Tools": "-",
+      "Educator Application": "-",
+      "Publish a Course": "-",
+      "Course Library": "-",
+      "Educator Earnings": "-"
+    },
   },
   "SL Accounts": {
     "My Profile": "-",
@@ -4171,6 +4688,16 @@ const defaultPermissions = {
       "Composer Applications": "-",
       // "Review Board": "-"
     },
+    "Educator Management": {
+      "Manage Educator": "-",
+      "Educator Tools": "-",
+    },
+    "Course Management": {
+      "Course Catalog": "-",
+      "Course Review": "-",
+      "Course Categories": "-",
+      "Course Order History": "-",
+    },
     "User Management": {
       "Users": "-",
       "Badge and Permissions": "-",
@@ -4180,14 +4707,25 @@ const defaultPermissions = {
       "Payment History": "-",
       "Subscription Settings": "-",
     },
+    "Document Management": {
+      "Manage Documents": "-",
+      "Document Categories": "-",
+    },
     "Planner Management": {
       "Planner Management": "-",
     },
     "Coupon Management": {
       "Coupon Management": "-",
     },
-    "Agreement Management": {
-      "Agreement Management": "-",
+    "Royalty Management": {
+      "Overview": "-",
+      "Royalties": "-",
+      "Payouts": "-",
+      "Composer Royalties": "-",
+      "Document Royalties": "-",
+      "Educator Royalties": "-",
+      "Review Board": "-",
+      "Copyright Holders": "-"
     }
   }
 
@@ -4195,6 +4733,7 @@ const defaultPermissions = {
 
 const predefinedBadges = [
   "Composer",
+  "Educator",
   "Review Board",
   "Director of SLC",
   "Director of SLA",
@@ -4245,6 +4784,62 @@ const seedRolePermissions = async () => {
   }
 };
 
+
+// ============================================
+// SUBSCRIPTION REMINDER LOGS TABLE
+// ============================================
+const createSubscriptionReminderLogsTable = async () => {
+  const mysqlConnection = getMySQLConnection();
+
+  const createTableSQL = `
+    CREATE TABLE IF NOT EXISTS subscription_reminder_logs (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+
+      user_id INT NOT NULL,
+      plan_id INT NOT NULL,
+
+      plan_end_date DATETIME NOT NULL,
+
+      reminder_type ENUM(
+        '30_days',
+        '7_days',
+        'expiry_day',
+        'expired'
+      ) NOT NULL,
+
+      sent_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      INDEX idx_user (user_id),
+      INDEX idx_plan (plan_id),
+      INDEX idx_plan_end_date (plan_end_date),
+      INDEX idx_reminder_type (reminder_type),
+
+      UNIQUE KEY unique_reminder (
+        user_id,
+        plan_id,
+        plan_end_date,
+        reminder_type
+      ),
+
+      CONSTRAINT fk_reminder_user
+        FOREIGN KEY (user_id)
+        REFERENCES users(id)
+        ON DELETE CASCADE,
+
+      CONSTRAINT fk_reminder_plan
+        FOREIGN KEY (plan_id)
+        REFERENCES plans(id)
+        ON DELETE CASCADE
+    );
+  `;
+
+  await mysqlConnection.execute(createTableSQL);
+
+  console.log("✅ subscription_reminder_logs table initialized");
+};
+
 // ============================================
 // PLANNER MASSPARTS SEEDING
 // ============================================
@@ -4260,65 +4855,432 @@ const seedPlannerMassparts = async () => {
       const payload = [
         {
           Music: {
-            HymnsSongs: [
-              "Prelude",
-              "Entrance",
-              "Offertory",
-              "Communion",
-              "Post-Communion",
-              "Recessional",
-              "Postlude",
-            ],
-            Proper: [
-              "Entrance Antiphon",
-              "Responsorial Psalm",
-              "Gospel Acclamation",
-              "Communion Antiphon",
-            ],
-            Ordinary: [
-              "Gloria",
-              "Profession of Faith (Creed)",
-              "Holy",
-              "Mystery of Faith",
-              "Lamb of God",
-              "The Lord's Prayer",
-              "Great Amen",
-              "Penitential Act (w/ Kyrie)",
-            ],
-            Instrumental: [
-              "Prelude (Instrumental)",
-              "Offertory (Instrumental)",
-              "Post-Communion (Instrumental)",
-              "Postlude (Instrumental)",
-            ],
-          }
+            HymnsSongs: {
+              config: {
+                reading: false,
+                music: true,
+                music_type: "Hymn / Song",
+              },
+              children: [
+                {
+                  Prelude: {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Hymn / Song",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  Entrance: {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Hymn / Song",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  Offertory: {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Hymn / Song",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  Communion: {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Hymn / Song",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Post-Communion": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Hymn / Song",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  Recessional: {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Hymn / Song",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  Postlude: {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Hymn / Song",
+                    },
+                    children: [],
+                  },
+                },
+              ],
+            },
+
+            Proper: {
+              config: {
+                reading: false,
+                music: true,
+                music_type: null,
+              },
+              children: [
+                {
+                  "Entrance Antiphon": {
+                    config: {
+                      reading: true,
+                      music: true,
+                      music_type: null,
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Responsorial Psalm": {
+                    config: {
+                      reading: true,
+                      music: true,
+                      music_type: "Responsorial Psalm",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Gospel Acclamation": {
+                    config: {
+                      reading: true,
+                      music: true,
+                      music_type: "Gospel Acclamation",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Communion Antiphon": {
+                    config: {
+                      reading: true,
+                      music: true,
+                      music_type: null,
+                    },
+                    children: [],
+                  },
+                },
+              ],
+            },
+
+            Ordinary: {
+              config: {
+                reading: false,
+                music: true,
+                music_type: "Mass Setting",
+              },
+              children: [
+                {
+                  Gloria: {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Mass Setting",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Profession of Faith (Creed)": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Mass Setting",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  Holy: {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Mass Setting",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Mystery of Faith": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Mass Setting",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Lamb of God": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Mass Setting",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "The Lord's Prayer": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Mass Setting",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Great Amen": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Mass Setting",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Penitential Act (w/ Kyrie)": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Mass Setting",
+                    },
+                    children: [],
+                  },
+                },
+              ],
+            },
+
+            Instrumental: {
+              config: {
+                reading: false,
+                music: true,
+                music_type: "Solo Instrument",
+              },
+              children: [
+                {
+                  "Prelude (Instrumental)": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Solo Instrument",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Offertory (Instrumental)": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Solo Instrument",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Post-Communion (Instrumental)": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Solo Instrument",
+                    },
+                    children: [],
+                  },
+                },
+                {
+                  "Postlude (Instrumental)": {
+                    config: {
+                      reading: false,
+                      music: true,
+                      music_type: "Solo Instrument",
+                    },
+                    children: [],
+                  },
+                },
+              ],
+            },
+          },
         },
+
         {
           Reading: [
-            "First Reading",
-            "Second Reading",
-            "Responsorial Psalm",
-            "Gospel Acclamation",
-            "Sequence",
-            "Gospel Reading",
-          ]
+            {
+              "First Reading": {
+                config: {
+                  reading: true,
+                  music: false,
+                  music_type: null,
+                },
+                children: [],
+              },
+            },
+            {
+              "Second Reading": {
+                config: {
+                  reading: true,
+                  music: false,
+                  music_type: null,
+                },
+                children: [],
+              },
+            },
+            {
+              "Responsorial Psalm": {
+                config: {
+                  reading: true,
+                  music: true,
+                  music_type: "Responsorial Psalm",
+                },
+                children: [],
+              },
+            },
+            {
+              "Gospel Acclamation": {
+                config: {
+                  reading: true,
+                  music: true,
+                  music_type: "Gospel Acclamation",
+                },
+                children: [],
+              },
+            },
+            {
+              Sequence: {
+                config: {
+                  reading: false,
+                  music: true,
+                  music_type: "Sequence",
+                },
+                children: [],
+              },
+            },
+            {
+              "Gospel Reading": {
+                config: {
+                  reading: true,
+                  music: false,
+                  music_type: null,
+                },
+                children: [],
+              },
+            },
+          ],
         },
+
         {
           Prayer: [
-            "Prayers of the Faithful",
-            "Collect",
-            "Prayer over the Offerings",
-            "Prayer after Communion",
-          ]
+            {
+              "Prayers of the Faithful": {
+                config: {
+                  reading: false,
+                  music: true,
+                  music_type: null,
+                },
+                children: [],
+              },
+            },
+            {
+              Collect: {
+                config: {
+                  reading: false,
+                  music: false,
+                  music_type: null,
+                },
+                children: [],
+              },
+            },
+            {
+              "Prayer over the Offerings": {
+                config: {
+                  reading: false,
+                  music: false,
+                  music_type: null,
+                },
+                children: [],
+              },
+            },
+            {
+              "Prayer after Communion": {
+                config: {
+                  reading: false,
+                  music: false,
+                  music_type: null,
+                },
+                children: [],
+              },
+            },
+          ],
         },
+
         {
           Other: [
-            "Homily",
-            "Dismissal of the Catechumens/Elect",
-            "Mass Setting (General)",
-            "Other (Namable)",
-          ]
-        }
+            {
+              Homily: {
+                config: {
+                  reading: false,
+                  music: false,
+                  music_type: null,
+                },
+                children: [],
+              },
+            },
+            {
+              "Dismissal of the Catechumens/Elect": {
+                config: {
+                  reading: false,
+                  music: true,
+                  music_type: "Hymn / Song",
+                },
+                children: [],
+              },
+            },
+            {
+              "Mass Setting (General)": {
+                config: {
+                  reading: false,
+                  music: true,
+                  music_type: "Mass Setting",
+                },
+                children: [],
+              },
+            },
+            {
+              "Other (Namable)": {
+                config: {
+                  reading: true,
+                  music: true,
+                  music_type: null,
+                },
+                children: [],
+              },
+            },
+          ],
+        },
       ];
 
       function normalizeWithDepth(data, depth = 0) {
@@ -4871,6 +5833,901 @@ const seedPlannerMassTemplates = async () => {
     }
   } catch (error) {
     console.error('❌ Error seeding planner mass templates:', error);
+  }
+};
+
+// ============================================================
+// PASTE INTO config/mysql.js — add these CREATE TABLE calls
+// inside your table-initialization sequence (same place
+// createFeaturesTable / composer_earnings etc. run), and call
+// seedRoyaltyDeductionEntities() once, after tables are created.
+// ============================================================
+
+const createRoyaltyTables = async () => {
+
+  // ============================================================
+  // 0. PLAN REVENUE ALLOCATIONS (Music/Planner/Academy/Documents %)
+  //    THIS WAS MISSING FROM THE PROJECT - distributeMusicSubscriptionPool,
+  //    distributeDocumentSubscriptionPool and distributeEducatorSubscriptionPool
+  //    all JOIN against this table, so without it every pay-period "close"
+  //    call was silently failing on subscription pro-rata distribution.
+  // ============================================================
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS plan_revenue_allocations (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      plan_id INT NOT NULL,
+      component_name VARCHAR(50) NOT NULL COMMENT 'Music, Planner, Academy, Documents',
+      allocation_percent DECIMAL(5,2) NOT NULL COMMENT 'e.g. 60.00, 40.00 - always percent based, never fixed $ (per SOW 3.1)',
+      royalty_eligible BOOLEAN DEFAULT TRUE COMMENT 'FALSE for Planner - 100% retained by SL, no royalty split',
+      notes TEXT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+      UNIQUE KEY unique_plan_component (plan_id, component_name),
+      INDEX idx_plan_id (plan_id),
+      INDEX idx_component_name (component_name),
+
+      FOREIGN KEY (plan_id) REFERENCES plans(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // ============================================================
+  // 1. DEDUCTION ENTITIES (dynamic — ICEL/USCCB/CCD + future ones)
+  // ============================================================
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS royalty_deduction_entities (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      name VARCHAR(50) UNIQUE NOT NULL,
+      description TEXT,
+      logo VARCHAR(500) NULL,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  await ensureTableColumns(mysqlConnection, 'royalty_deduction_entities', [
+    { name: 'logo', alter: 'ADD COLUMN logo VARCHAR(500) NULL AFTER description' }
+  ]);
+
+  // ============================================================
+  // 2. PRODUCT-LEVEL ROYALTY CONFIG (SOW 4.5)
+  //    Works for both 'music' (music_publications) and 'document' (documents)
+  // ============================================================
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS product_royalty_config (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      product_type ENUM('music', 'document') NOT NULL,
+      product_id INT NOT NULL,
+      deduction_entity_id INT NOT NULL,
+      applies BOOLEAN DEFAULT FALSE,
+      percent DECIMAL(5,2) DEFAULT 0.00,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+      UNIQUE KEY unique_product_entity (product_type, product_id, deduction_entity_id),
+      INDEX idx_product (product_type, product_id),
+      FOREIGN KEY (deduction_entity_id) REFERENCES royalty_deduction_entities(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // ============================================================
+  // 3. EXTEND composer_earnings WITH DEDUCTION-AWARE COLUMNS
+  //    (keeps the existing table/dashboard working, adds the fields
+  //    the SOW math needs: gross -> deductions -> net -> 30% -> SL)
+  // ============================================================
+  const composerEarningsColumns = [
+    { name: 'source_type', alter: "ADD COLUMN source_type ENUM('a_la_carte','subscription','one_license') DEFAULT 'a_la_carte'" },
+    { name: 'total_deductions', alter: "ADD COLUMN total_deductions DECIMAL(10,2) DEFAULT 0.00" },
+    { name: 'net_after_deductions', alter: "ADD COLUMN net_after_deductions DECIMAL(10,2) DEFAULT 0.00" },
+    { name: 'royalty_percent', alter: "ADD COLUMN royalty_percent DECIMAL(5,2) DEFAULT 30.00" },
+    { name: 'usage_share_percent', alter: "ADD COLUMN usage_share_percent DECIMAL(8,4) NULL" },
+    { name: 'pay_period', alter: "ADD COLUMN pay_period VARCHAR(20) NULL" },
+    { name: 'one_license_record_id', alter: "ADD COLUMN one_license_record_id INT NULL" }
+  ];
+  // Use your existing ensureTableColumns(mysqlConnection, 'composer_earnings', composerEarningsColumns) helper here.
+
+  // Breakdown of which entities were deducted from a given composer_earnings row
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS composer_earning_deductions (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      composer_earning_id BIGINT UNSIGNED NOT NULL,
+      deduction_entity_id INT NOT NULL,
+      percent DECIMAL(5,2) NOT NULL,
+      amount DECIMAL(10,2) NOT NULL,
+      status ENUM('pending','paid') DEFAULT 'pending',
+      paid_at DATETIME NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      FOREIGN KEY (composer_earning_id) REFERENCES composer_earnings(id) ON DELETE CASCADE,
+      FOREIGN KEY (deduction_entity_id) REFERENCES royalty_deduction_entities(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // ============================================================
+  // 4. DOCUMENT ROYALTY (parallel to composer_earnings, for document owners)
+  // ============================================================
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS document_royalty_earnings (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      owner_id INT NOT NULL,                        -- documents.created_by / upload_by
+      document_id INT NOT NULL,
+      document_title VARCHAR(500) NULL,
+      gross_amount DECIMAL(10,2) NOT NULL DEFAULT 0,
+      total_deductions DECIMAL(10,2) NOT NULL DEFAULT 0,
+      net_after_deductions DECIMAL(10,2) NOT NULL DEFAULT 0,
+      royalty_percent DECIMAL(5,2) NOT NULL DEFAULT 30.00,
+      owner_earning DECIMAL(10,2) NOT NULL DEFAULT 0,
+      usage_share_percent DECIMAL(8,4) NULL,
+      pay_period VARCHAR(20) NULL,
+      status ENUM('pending','paid','cancelled') DEFAULT 'pending',
+      paid_at DATETIME NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      INDEX idx_owner (owner_id),
+      INDEX idx_status (status),
+      FOREIGN KEY (owner_id) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS document_royalty_deductions (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      document_royalty_earning_id BIGINT UNSIGNED NOT NULL,
+      deduction_entity_id INT NOT NULL,
+      percent DECIMAL(5,2) NOT NULL,
+      amount DECIMAL(10,2) NOT NULL,
+      status ENUM('pending','paid') DEFAULT 'pending',
+      paid_at DATETIME NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      FOREIGN KEY (document_royalty_earning_id) REFERENCES document_royalty_earnings(id) ON DELETE CASCADE,
+      FOREIGN KEY (deduction_entity_id) REFERENCES royalty_deduction_entities(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // Usage log for documents — "Add to My Documents" equivalent for pro-rata split
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS document_access_log (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL,
+      document_id INT NOT NULL,
+      accessed_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      INDEX idx_document (document_id),
+      INDEX idx_user (user_id),
+      INDEX idx_accessed_at (accessed_at)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // ============================================================
+  // 5. ONE LICENSE IMPORTS (SOW 3.3)
+  // ============================================================
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS one_license_uploads (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      file_name VARCHAR(255) NOT NULL,
+      file_url VARCHAR(500),
+      file_hash VARCHAR(64),
+      uploaded_by INT NOT NULL,
+      report_name VARCHAR(255),
+      report_period VARCHAR(255) COMMENT 'Reporting period assigned to the WHOLE batch - individual rows have no date',
+      status ENUM('processing','completed','failed') DEFAULT 'processing',
+      total_rows INT DEFAULT 0,
+      matched_rows INT DEFAULT 0,
+      needs_review_rows INT DEFAULT 0,
+      processed_rows INT DEFAULT 0,
+      worksheets_processed INT DEFAULT 0,
+      error_message TEXT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      UNIQUE KEY unique_file_hash (file_hash),
+      FOREIGN KEY (uploaded_by) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS one_license_records (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      upload_id INT NOT NULL,
+      music_publication_id INT NULL,
+
+      -- Source worksheet, preserved exactly (SOW/client spec Aug 2026 -
+      -- same SKU can legitimately appear on multiple worksheets, these
+      -- must NEVER be merged into one row)
+      source_sheet VARCHAR(100) NOT NULL COMMENT 'e.g. Annual_Catholic, Podcast_Protestant, Recording',
+      revenue_type VARCHAR(50) NULL COMMENT 'Annual, Podcast, Recording',
+      category VARCHAR(50) NULL COMMENT 'Catholic, Protestant - if provided',
+      territory_region VARCHAR(20) NULL COMMENT 'US (default), AU, EU, etc. - original code preserved as-is',
+
+      sku VARCHAR(100) NOT NULL COMMENT 'Stored as text - not all SKUs are numeric (e.g. SLM4320, 34069b)',
+      title VARCHAR(500),
+      report_period VARCHAR(255) COMMENT 'Denormalized copy of the batch reporting period, for convenience',
+      registrations DECIMAL(12,4) DEFAULT 0,
+      value DECIMAL(14,6) DEFAULT 0 COMMENT 'Full precision gross revenue - NOT rounded to cents until the final composer_earning row',
+
+      match_method ENUM('sku_exact','needs_review','manual') DEFAULT 'needs_review'
+        COMMENT 'sku_exact = confidently auto-matched by SKU. Title similarity alone never auto-matches (client requirement) - it only suggests a candidate for manual review.',
+      suggested_music_publication_id INT NULL COMMENT 'Best-guess title match, shown to admin for confirmation - never auto-applied',
+
+      status ENUM('unmatched','matched','processed') DEFAULT 'unmatched',
+      composer_earning_id BIGINT UNSIGNED NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      INDEX idx_upload (upload_id),
+      INDEX idx_publication (music_publication_id),
+      INDEX idx_status (status),
+      INDEX idx_sku (sku),
+      INDEX idx_source_sheet (source_sheet),
+      FOREIGN KEY (upload_id) REFERENCES one_license_uploads(id) ON DELETE CASCADE
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // ALTERs for uploads that already ran before this spec update
+  await mysqlConnection.execute(`
+    ALTER TABLE one_license_uploads
+    ADD COLUMN needs_review_rows INT DEFAULT 0,
+    ADD COLUMN worksheets_processed INT DEFAULT 0
+  `).catch((err) => console.log('ℹ️ one_license_uploads columns ALTER skipped:', err.message));
+
+  await mysqlConnection.execute(`
+    ALTER TABLE one_license_records
+    ADD COLUMN source_sheet VARCHAR(100) NOT NULL DEFAULT 'Unknown',
+    ADD COLUMN revenue_type VARCHAR(50) NULL,
+    ADD COLUMN category VARCHAR(50) NULL,
+    ADD COLUMN territory_region VARCHAR(20) NULL,
+    ADD COLUMN match_method ENUM('sku_exact','needs_review','manual') DEFAULT 'needs_review',
+    ADD COLUMN suggested_music_publication_id INT NULL,
+    MODIFY COLUMN value DECIMAL(14,6) DEFAULT 0,
+    MODIFY COLUMN registrations DECIMAL(12,4) DEFAULT 0
+  `).catch((err) => console.log('ℹ️ one_license_records columns ALTER skipped:', err.message));
+
+  // ============================================================
+  // 6. REVIEW BOARD STIPENDS (SOW 7.1-7.2)
+  // ============================================================
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS review_board_stipend_rates (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      type_of_music VARCHAR(100) NOT NULL UNIQUE,
+      rate DECIMAL(6,2) NOT NULL,
+      is_active BOOLEAN DEFAULT TRUE,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS review_board_stipends (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      reviewer_id INT NOT NULL,
+      music_publication_id INT NULL,
+      composition_title VARCHAR(500) NULL,
+      type_of_music VARCHAR(100) NOT NULL,
+      rate_applied DECIMAL(6,2) NOT NULL,
+      status ENUM('pending','paid') DEFAULT 'pending',
+      payment_method ENUM('venmo','paypal','cashapp','check','other') NULL,
+      payment_reference VARCHAR(255) NULL,
+      paid_at DATETIME NULL,
+      pay_period VARCHAR(20) NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      INDEX idx_reviewer (reviewer_id),
+      INDEX idx_status (status),
+      INDEX idx_publication (music_publication_id),
+      FOREIGN KEY (reviewer_id) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // ============================================================
+  // 7. PAYOUT METHOD (shared by composer / document owner / review board)
+  // ============================================================
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS user_payout_methods (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      user_id INT NOT NULL UNIQUE,
+      method ENUM('venmo','paypal','cashapp','check','other') NOT NULL,
+      handle VARCHAR(255) NULL,
+      mailing_address TEXT NULL,
+      notes TEXT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+      FOREIGN KEY (user_id) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // ============================================================
+  // 8. RETURNS / REFUNDS LOG (SOW 3.1/3.2 - "lost revenue" tracking)
+  // ============================================================
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS royalty_returns (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      earning_type ENUM('composer','document','educator') NOT NULL,
+      earning_id BIGINT UNSIGNED NOT NULL,
+      recipient_id INT NOT NULL,
+      gross_amount_reversed DECIMAL(10,2) NOT NULL DEFAULT 0,
+      recipient_amount_reversed DECIMAL(10,2) NOT NULL DEFAULT 0,
+      reason TEXT NULL,
+      processed_by INT NOT NULL,
+      returned_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      INDEX idx_recipient (recipient_id),
+      INDEX idx_returned_at (returned_at),
+      FOREIGN KEY (recipient_id) REFERENCES users(id),
+      FOREIGN KEY (processed_by) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // ============================================================
+  // 9. EDUCATOR EARNINGS (Academy - parallel to composer_earnings)
+  // ============================================================
+  await mysqlConnection.execute(`
+    ALTER TABLE product_royalty_config
+    MODIFY COLUMN product_type ENUM('music', 'document', 'course') NOT NULL
+  `).catch((err) => {
+    console.log('ℹ️ product_royalty_config.product_type ALTER skipped:', err.message);
+  });
+
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS educator_earnings (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      educator_id INT NOT NULL,
+      course_id INT NOT NULL,
+      course_title VARCHAR(500) NULL,
+      buyer_user_id INT NULL,
+
+      sale_price DECIMAL(10,2) NOT NULL DEFAULT 0,
+      platform_fee_pct DECIMAL(5,2) DEFAULT 0,
+      platform_fee_amount DECIMAL(10,2) DEFAULT 0,
+      educator_earning DECIMAL(10,2) NOT NULL DEFAULT 0,
+
+      source_type ENUM('a_la_carte','subscription') DEFAULT 'a_la_carte',
+      total_deductions DECIMAL(10,2) DEFAULT 0.00,
+      net_after_deductions DECIMAL(10,2) DEFAULT 0.00,
+      royalty_percent DECIMAL(5,2) DEFAULT 30.00,
+      usage_share_percent DECIMAL(8,4) NULL,
+      pay_period VARCHAR(20) NULL,
+
+      transaction_id VARCHAR(255) NULL,
+      stripe_session_id VARCHAR(255) NULL,
+      payment_method VARCHAR(50) DEFAULT 'stripe',
+
+      status ENUM('pending','paid','cancelled') DEFAULT 'pending',
+      paid_at DATETIME NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+
+      INDEX idx_educator (educator_id),
+      INDEX idx_course (course_id),
+      INDEX idx_status (status),
+      INDEX idx_pay_period (pay_period),
+      FOREIGN KEY (educator_id) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS educator_earning_deductions (
+      id BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+      educator_earning_id BIGINT UNSIGNED NOT NULL,
+      deduction_entity_id INT NOT NULL,
+      percent DECIMAL(5,2) NOT NULL,
+      amount DECIMAL(10,2) NOT NULL,
+      status ENUM('pending','paid') DEFAULT 'pending',
+      paid_at DATETIME NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      FOREIGN KEY (educator_earning_id) REFERENCES educator_earnings(id) ON DELETE CASCADE,
+      FOREIGN KEY (deduction_entity_id) REFERENCES royalty_deduction_entities(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  // ============================================================
+  // ALTER: add entity-level payout status to the 3 deduction-breakdown
+  // tables (needed for the "Copyright Holders" dashboard - paid/pending
+  // amounts per entity, not just per composer/educator/document-owner)
+  // ============================================================
+  await mysqlConnection.execute(`
+    ALTER TABLE composer_earning_deductions
+    ADD COLUMN status ENUM('pending','paid') DEFAULT 'pending',
+    ADD COLUMN paid_at DATETIME NULL
+  `).catch((err) => console.log('ℹ️ composer_earning_deductions status ALTER skipped:', err.message));
+
+  await mysqlConnection.execute(`
+    ALTER TABLE document_royalty_deductions
+    ADD COLUMN status ENUM('pending','paid') DEFAULT 'pending',
+    ADD COLUMN paid_at DATETIME NULL
+  `).catch((err) => console.log('ℹ️ document_royalty_deductions status ALTER skipped:', err.message));
+
+  await mysqlConnection.execute(`
+    ALTER TABLE educator_earning_deductions
+    ADD COLUMN status ENUM('pending','paid') DEFAULT 'pending',
+    ADD COLUMN paid_at DATETIME NULL
+  `).catch((err) => console.log('ℹ️ educator_earning_deductions status ALTER skipped:', err.message));
+
+  // ============================================================
+  // PRO-RATA SUBSCRIPTION ROYALTY SUPPORT (per client spec, Aug 2026)
+  // ------------------------------------------------------------
+  // The old count-based usage split is replaced by a dollar-weighted
+  // "Pro-Rata Factor" method: each subscription acquisition is weighted
+  // by the product's Single Purchase Price (snapshotted at acquisition
+  // time), not counted equally. See calculateMusicProRataDistribution /
+  // calculateEducatorProRataDistribution in royaltyEngine.js.
+  // ============================================================
+
+  // ALTER: distinguish subscription-covered acquisitions from a-la-carte
+  // purchases in user_music_library (both currently insert into the same
+  // table - without this flag, a-la-carte sales would double-count into
+  // the subscription Pro-Rata pool, which already pays them separately).
+  await mysqlConnection.execute(`
+    ALTER TABLE user_music_library
+    ADD COLUMN source_type ENUM('subscription','a_la_carte') DEFAULT 'subscription'
+  `).catch((err) => console.log('ℹ️ user_music_library.source_type ALTER skipped:', err.message));
+
+  // ALTER: course_enrollments needs the same source distinction, PLUS a
+  // price snapshot (it currently has no price column at all - courses
+  // acquired via subscription never recorded what they were worth).
+  await mysqlConnection.execute(`
+    ALTER TABLE course_enrollments
+    ADD COLUMN source_type ENUM('free','subscription','a_la_carte') DEFAULT 'free',
+    ADD COLUMN price_at_enrollment DECIMAL(10,2) NULL
+  `).catch((err) => console.log('ℹ️ course_enrollments source_type/price ALTER skipped:', err.message));
+
+  // ============================================================
+  // CONFIGURABLE PAY PERIOD LENGTH (per component - Music/Academy/Documents)
+  // Client wants 12-month default but SL Team must be able to change it
+  // (e.g. to 6 or 3 months) without a code change.
+  // ============================================================
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS royalty_pay_period_settings (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      component_name VARCHAR(50) NOT NULL UNIQUE COMMENT 'Music, Academy, Documents',
+      period_months INT NOT NULL DEFAULT 12,
+      updated_by INT NULL,
+      updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      FOREIGN KEY (updated_by) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  await mysqlConnection.execute(`
+    INSERT IGNORE INTO royalty_pay_period_settings (component_name, period_months) VALUES
+    ('Music', 12), ('Academy', 12), ('Documents', 12)
+  `);
+
+  // ============================================================
+  // PRO-RATA RUN LOG (audit trail - SOW 11: "All distributions must be
+  // fully traceable". Records the TAP/TSS/Factor for every calculation
+  // so numbers can be explained/reconciled later, exactly like the
+  // client's Master Payment Spreadsheet columns.)
+  // ============================================================
+  await mysqlConnection.execute(`
+    CREATE TABLE IF NOT EXISTS royalty_pro_rata_runs (
+      id INT AUTO_INCREMENT PRIMARY KEY,
+      component_name VARCHAR(50) NOT NULL COMMENT 'Music or Academy',
+      period_start DATE NOT NULL,
+      period_end DATE NOT NULL,
+      pay_period VARCHAR(20) NOT NULL,
+      eligible_subscription_revenue DECIMAL(14,4) NOT NULL COMMENT 'TSS',
+      total_single_purchase_equivalent_value DECIMAL(14,4) NOT NULL COMMENT 'TAP',
+      pro_rata_factor DECIMAL(20,10) NOT NULL,
+      qualifying_acquisitions INT NOT NULL DEFAULT 0,
+      distinct_products INT NOT NULL DEFAULT 0,
+      total_royalty_distributed DECIMAL(14,2) NOT NULL DEFAULT 0,
+      run_by INT NULL,
+      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+
+      INDEX idx_component_period (component_name, pay_period),
+      FOREIGN KEY (run_by) REFERENCES users(id)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+  `);
+
+  console.log('✅ Royalty distribution tables created/ensured (incl. educator/Academy)');
+};
+
+// ============================================================
+// SEED: ICEL / USCCB / CCD (run once, after createRoyaltyTables)
+// ============================================================
+const seedRoyaltyDeductionEntities = async () => {
+  const entities = [
+    { name: 'ICEL', description: 'International Commission on English in the Liturgy' },
+    { name: 'USCCB', description: 'United States Conference of Catholic Bishops' },
+    { name: 'CCD', description: 'Confraternity of Christian Doctrine' }
+  ];
+
+  for (const entity of entities) {
+    await mysqlConnection.execute(`
+      INSERT IGNORE INTO royalty_deduction_entities (name, description)
+      VALUES (?, ?)
+    `, [entity.name, entity.description]);
+  }
+
+  // Default stipend rates from SOW 7.2
+  const stipendRates = [
+    { type_of_music: 'Responsorial Psalm', rate: 2.50 },
+    { type_of_music: 'Antiphon', rate: 2.50 },
+    { type_of_music: 'Gospel Acclamation', rate: 2.50 },
+    { type_of_music: 'Hymn / Song', rate: 5.00 },
+    { type_of_music: 'Sequence', rate: 5.00 },
+    { type_of_music: 'Solo Instrument', rate: 5.00 },
+    { type_of_music: 'Mass Settings', rate: 10.00 }
+  ];
+
+  for (const rate of stipendRates) {
+    await mysqlConnection.execute(`
+      INSERT IGNORE INTO review_board_stipend_rates (type_of_music, rate)
+      VALUES (?, ?)
+    `, [rate.type_of_music, rate.rate]);
+  }
+
+  console.log('✅ Royalty deduction entities + stipend rates seeded');
+};
+
+// ============================================
+// COMMUNITY PORTAL TABLES
+// (Community Feed, Discussions, Groups, Private
+//  Messaging, Channels, Prayer Intentions, Moderation)
+// ============================================
+const createCommunityPortalTables = async () => {
+  try {
+    // 1. GROUPS
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_groups (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(150) NOT NULL,
+        description TEXT DEFAULT NULL,
+        visibility ENUM('public','private') DEFAULT 'public',
+        group_type ENUM('diocesan','parish','composer','interest','general') DEFAULT 'general',
+        cover_image VARCHAR(500) DEFAULT NULL,
+        diocese_id INT DEFAULT NULL,
+        parish_id INT DEFAULT NULL,
+        created_by INT NOT NULL,
+        member_count INT DEFAULT 1,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        deleted_at TIMESTAMP NULL,
+        INDEX idx_visibility (visibility),
+        INDEX idx_group_type (group_type),
+        INDEX idx_created_by (created_by),
+        FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // 2. GROUP MEMBERS
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_group_members (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        group_id INT NOT NULL,
+        user_id INT NOT NULL,
+        role ENUM('owner','moderator','member') DEFAULT 'member',
+        status ENUM('active','pending','banned') DEFAULT 'active',
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_group_member (group_id, user_id),
+        INDEX idx_group (group_id),
+        INDEX idx_user (user_id),
+        FOREIGN KEY (group_id) REFERENCES cp_groups(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // 3. CHANNELS
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_channels (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        name VARCHAR(150) NOT NULL,
+        slug VARCHAR(170) NOT NULL UNIQUE,
+        description TEXT DEFAULT NULL,
+        channel_type ENUM('global','private','composer','parish','diocesan','group') DEFAULT 'global',
+        allowed_roles JSON DEFAULT NULL,
+        group_id INT DEFAULT NULL,
+        diocese_id INT DEFAULT NULL,
+        is_read_only BOOLEAN DEFAULT FALSE,
+        is_active BOOLEAN DEFAULT TRUE,
+        created_by INT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_channel_type (channel_type),
+        INDEX idx_group (group_id),
+        FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    try {
+      await mysqlConnection.execute(
+        `ALTER TABLE cp_channels ADD COLUMN is_read_only BOOLEAN DEFAULT FALSE AFTER diocese_id`
+      );
+    } catch (e) {
+      // Column already exists, ignore
+    }
+
+
+    // 4. CHANNEL MEMBERS (private / composer-only / diocesan channels)
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_channel_members (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        channel_id INT NOT NULL,
+        user_id INT NOT NULL,
+        role ENUM('admin','member') DEFAULT 'member',
+        status VARCHAR(20) DEFAULT 'active',
+        added_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_channel_member (channel_id, user_id),
+        FOREIGN KEY (channel_id) REFERENCES cp_channels(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    try {
+      await mysqlConnection.execute(
+        `ALTER TABLE cp_channel_members ADD COLUMN status VARCHAR(20) DEFAULT 'active' AFTER role`
+      );
+    } catch (e) {
+      // Column already exists, ignore
+    }
+
+    // 5. FEED POSTS
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_posts (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        author_id INT NOT NULL,
+        channel_id INT DEFAULT NULL,
+        group_id INT DEFAULT NULL,
+        content TEXT NOT NULL,
+        images JSON DEFAULT NULL,
+        linked_product_type ENUM('music_publication','course') DEFAULT NULL,
+        linked_product_id INT DEFAULT NULL,
+        linked_product_title VARCHAR(255) DEFAULT NULL,
+        linked_product_url VARCHAR(500) DEFAULT NULL,
+        is_pinned BOOLEAN DEFAULT FALSE,
+        is_hidden BOOLEAN DEFAULT FALSE,
+        status ENUM('active','removed') DEFAULT 'active',
+        like_count INT DEFAULT 0,
+        comment_count INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        deleted_at TIMESTAMP NULL,
+        INDEX idx_author (author_id),
+        INDEX idx_channel (channel_id),
+        INDEX idx_group (group_id),
+        INDEX idx_status (status),
+        INDEX idx_created (created_at),
+        FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (channel_id) REFERENCES cp_channels(id) ON DELETE SET NULL,
+        FOREIGN KEY (group_id) REFERENCES cp_groups(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // 6. DISCUSSION THREADS
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_discussion_threads (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        author_id INT NOT NULL,
+        channel_id INT DEFAULT NULL,
+        group_id INT DEFAULT NULL,
+        title VARCHAR(255) NOT NULL,
+        body TEXT NOT NULL,
+        images JSON DEFAULT NULL,
+        category VARCHAR(100) DEFAULT NULL,
+        is_pinned BOOLEAN DEFAULT FALSE,
+        is_locked BOOLEAN DEFAULT FALSE,
+        is_hidden BOOLEAN DEFAULT FALSE,
+        status ENUM('active','removed') DEFAULT 'active',
+        view_count INT DEFAULT 0,
+        reply_count INT DEFAULT 0,
+        last_activity_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        deleted_at TIMESTAMP NULL,
+        INDEX idx_author (author_id),
+        INDEX idx_channel (channel_id),
+        INDEX idx_group (group_id),
+        INDEX idx_category (category),
+        INDEX idx_last_activity (last_activity_at),
+        FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (channel_id) REFERENCES cp_channels(id) ON DELETE SET NULL,
+        FOREIGN KEY (group_id) REFERENCES cp_groups(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // 6.5. DISCUSSION THREAD VIEWS (Unique view tracking)
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_thread_views (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        thread_id INT NOT NULL,
+        user_id INT NOT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_thread_user (thread_id, user_id),
+        FOREIGN KEY (thread_id) REFERENCES cp_discussion_threads(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // 7. PRAYER INTENTIONS
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_prayer_intentions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        author_id INT NOT NULL,
+        group_id INT DEFAULT NULL,
+        title VARCHAR(255) DEFAULT NULL,
+        content TEXT NOT NULL,
+        is_anonymous BOOLEAN DEFAULT FALSE,
+        status ENUM('ongoing','answered','closed') DEFAULT 'ongoing',
+        is_hidden BOOLEAN DEFAULT FALSE,
+        pray_count INT DEFAULT 0,
+        response_count INT DEFAULT 0,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        deleted_at TIMESTAMP NULL,
+        INDEX idx_author (author_id),
+        INDEX idx_status (status),
+        INDEX idx_created (created_at),
+        FOREIGN KEY (author_id) REFERENCES users(id) ON DELETE CASCADE,
+        FOREIGN KEY (group_id) REFERENCES cp_groups(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // 8. COMMENTS (unified: post comments, thread replies, prayer responses)
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_comments (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        parent_type ENUM('post','thread','prayer') NOT NULL,
+        parent_id INT NOT NULL,
+        parent_comment_id INT DEFAULT NULL,
+        user_id INT NOT NULL,
+        content TEXT NOT NULL,
+        images JSON DEFAULT NULL,
+        is_hidden BOOLEAN DEFAULT FALSE,
+        status ENUM('active','removed') DEFAULT 'active',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        deleted_at TIMESTAMP NULL,
+        INDEX idx_parent (parent_type, parent_id),
+        INDEX idx_user (user_id),
+        INDEX idx_parent_comment (parent_comment_id),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // 9. REACTIONS (likes / "praying for this")
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_reactions (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        target_type ENUM('post','comment','thread','prayer') NOT NULL,
+        target_id INT NOT NULL,
+        user_id INT NOT NULL,
+        reaction_type ENUM('like','pray') DEFAULT 'like',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_reaction (target_type, target_id, user_id, reaction_type),
+        INDEX idx_target (target_type, target_id),
+        INDEX idx_user (user_id),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // 10. CONVERSATIONS (private messaging)
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_conversations (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        type ENUM('direct','group','channel') DEFAULT 'direct',
+        channel_id INT DEFAULT NULL,
+        title VARCHAR(150) DEFAULT NULL,
+        cover_image VARCHAR(500) DEFAULT NULL,
+        created_by INT NOT NULL,
+        last_message_at TIMESTAMP NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_type (type),
+        INDEX idx_channel (channel_id),
+        INDEX idx_last_message (last_message_at),
+        FOREIGN KEY (created_by) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    try {
+      await mysqlConnection.execute(`ALTER TABLE cp_conversations MODIFY COLUMN type ENUM('direct','group','channel') DEFAULT 'direct'`);
+    } catch (e) {}
+    try {
+      await mysqlConnection.execute(`ALTER TABLE cp_conversations ADD COLUMN channel_id INT DEFAULT NULL AFTER type`);
+    } catch (e) {}
+    try {
+      await mysqlConnection.execute(`ALTER TABLE cp_conversations ADD INDEX idx_channel (channel_id)`);
+    } catch (e) {}
+
+    // 11. CONVERSATION PARTICIPANTS
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_conversation_participants (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        conversation_id INT NOT NULL,
+        user_id INT NOT NULL,
+        role ENUM('member','admin') DEFAULT 'member',
+        last_read_at TIMESTAMP NULL,
+        is_active BOOLEAN DEFAULT TRUE,
+        joined_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE KEY unique_participant (conversation_id, user_id),
+        INDEX idx_user (user_id),
+        FOREIGN KEY (conversation_id) REFERENCES cp_conversations(id) ON DELETE CASCADE,
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // 12. MESSAGES
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_messages (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        conversation_id INT NOT NULL,
+        sender_id INT NOT NULL,
+        content TEXT DEFAULT NULL,
+        attachments JSON DEFAULT NULL,
+        status ENUM('sent','edited','deleted') DEFAULT 'sent',
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+        INDEX idx_conversation (conversation_id),
+        INDEX idx_sender (sender_id),
+        INDEX idx_created (created_at),
+        FOREIGN KEY (conversation_id) REFERENCES cp_conversations(id) ON DELETE CASCADE,
+        FOREIGN KEY (sender_id) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // 13. MODERATION REPORTS
+    await mysqlConnection.execute(`
+      CREATE TABLE IF NOT EXISTS cp_reports (
+        id INT AUTO_INCREMENT PRIMARY KEY,
+        content_type ENUM('post','comment','thread','reply','prayer','group','message') NOT NULL,
+        content_id INT NOT NULL,
+        reported_by INT NOT NULL,
+        reason VARCHAR(255) NOT NULL,
+        details TEXT DEFAULT NULL,
+        status ENUM('pending','reviewed','dismissed','action_taken') DEFAULT 'pending',
+        reviewed_by INT DEFAULT NULL,
+        reviewed_at TIMESTAMP NULL,
+        resolution_note TEXT DEFAULT NULL,
+        created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+        INDEX idx_content (content_type, content_id),
+        INDEX idx_status (status),
+        FOREIGN KEY (reported_by) REFERENCES users(id) ON DELETE CASCADE
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci
+    `);
+
+    // Cleanup: Remove default Global Community channel & dummy seed messages if they exist
+    await mysqlConnection.execute(
+      `DELETE FROM cp_channels WHERE slug = 'global-community' OR name = 'Global Community'`
+    );
+    await mysqlConnection.execute(
+      `DELETE FROM cp_discussion_threads WHERE body LIKE '%Create a structured community system%' OR title LIKE '%Channel Update%'`
+    );
+
+    console.log('✅ Community Portal tables initialized successfully');
+  } catch (error) {
+    console.error('❌ Failed to initialize Community Portal tables:', error);
+    throw error;
+  }
+};
+
+// ============================================
+// SYSTEM CONFIGURATIONS TABLE & SEEDING
+// ============================================
+const createSystemConfigurationsTable = async () => {
+  try {
+    const createTableSQL = `
+      CREATE TABLE IF NOT EXISTS system_configurations (
+        config_key VARCHAR(100) PRIMARY KEY,
+        config_value VARCHAR(255) NOT NULL,
+        description VARCHAR(255) NULL,
+        updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+      ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+    `;
+    await mysqlConnection.execute(createTableSQL);
+
+    const seedSQL = `
+      INSERT INTO system_configurations (config_key, config_value, description)
+      VALUES ('site_maintenance_mode', 'false', 'Controls global platform maintenance mode')
+      ON DUPLICATE KEY UPDATE config_key = config_key;
+    `;
+    await mysqlConnection.execute(seedSQL);
+    console.log('✅ system_configurations table ready');
+  } catch (err) {
+    console.error('Failed to create system_configurations table:', err);
+    throw err;
   }
 };
 

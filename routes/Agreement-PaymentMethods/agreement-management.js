@@ -445,6 +445,43 @@ router.get("/my-assignments", auth, async (req, res) => {
         }
         if (!Array.isArray(userBadges)) userBadges = [];
 
+        // Fetch user's published music publications to map admin signature details
+        const [publications] = await mysqlConnection.execute(
+            `SELECT id, composition_title, ContractHTMLJSON, published_at, created_at, finalContractTime, signedContractUrl, composition_description FROM music_publications WHERE composer_id = ? AND status = 'published'`,
+            [userId]
+        );
+
+        const pubMap = new Map();
+        const matchedTitles = new Set();
+
+        for (const pub of publications) {
+            let contractData = null;
+            if (pub.ContractHTMLJSON) {
+                try {
+                    contractData = typeof pub.ContractHTMLJSON === "string"
+                        ? JSON.parse(pub.ContractHTMLJSON)
+                        : pub.ContractHTMLJSON;
+                } catch (e) {
+                    // Ignore
+                }
+            }
+            if (contractData && pub.composition_title) {
+                const titleKey = pub.composition_title.trim().toLowerCase();
+                pubMap.set(titleKey, {
+                    pubId: pub.id,
+                    publishedAt: pub.published_at,
+                    createdAt: pub.created_at,
+                    finalContractTime: pub.finalContractTime,
+                    signedContractUrl: pub.signedContractUrl,
+                    description: pub.composition_description,
+                    composerSignedPdfUrl: contractData.composerSignedPdfUrl || null,
+                    adminSignatureUrl: contractData.adminSignatureUrl || null,
+                    adminSignedPdfUrl: contractData.adminSignedPdfUrl || null,
+                    adminSignedDate: contractData.adminSignedDate || null
+                });
+            }
+        }
+
         // 2️⃣ Fetch all active agreements
         const [agreements] = await mysqlConnection.execute(
             `SELECT * FROM agreements WHERE status = 1`
@@ -484,11 +521,22 @@ router.get("/my-assignments", auth, async (req, res) => {
                 [userId, ag.id]
             );
 
+            // Get admin signature details if title matches a published publication
+            const matchedPub = ag.agreement_title ? pubMap.get(ag.agreement_title.trim().toLowerCase()) : null;
+            if (matchedPub) {
+                matchedTitles.add(ag.agreement_title.trim().toLowerCase());
+            }
+
             let status = "pending";
             let signature_details = null;
             if (signatureRows && signatureRows.length > 0) {
                 status = signatureRows[0].status || "pending";
-                signature_details = signatureRows[0];
+                signature_details = {
+                    ...signatureRows[0],
+                    adminSignatureUrl: matchedPub ? matchedPub.adminSignatureUrl : null,
+                    adminSignedPdfUrl: matchedPub ? matchedPub.adminSignedPdfUrl : null,
+                    adminSignedDate: matchedPub ? matchedPub.adminSignedDate : null
+                };
             }
 
             results.push({
@@ -503,10 +551,75 @@ router.get("/my-assignments", auth, async (req, res) => {
                 status,
                 signature_details,
                 signature_position: ag.signature_position ? safeParseArray(ag.signature_position) : null,
-                uploaded_on: ag.uploaded_on
+                uploaded_on: ag.uploaded_on,
+                adminSignatureUrl: matchedPub ? matchedPub.adminSignatureUrl : null,
+                adminSignedPdfUrl: matchedPub ? matchedPub.adminSignedPdfUrl : null,
+                adminSignedDate: matchedPub ? matchedPub.adminSignedDate : null
             });
 
             included.set(ag.id, true);
+        }
+
+        // Dynamically append any published publications that weren't matched as agreements
+        for (const pub of publications) {
+            if (!pub.composition_title) continue;
+            const titleKey = pub.composition_title.trim().toLowerCase();
+            if (matchedTitles.has(titleKey)) continue;
+
+            let contractData = null;
+            if (pub.ContractHTMLJSON) {
+                try {
+                    contractData = typeof pub.ContractHTMLJSON === "string"
+                        ? JSON.parse(pub.ContractHTMLJSON)
+                        : pub.ContractHTMLJSON;
+                } catch (e) {
+                    // Ignore
+                }
+            }
+            if (!contractData) continue;
+
+            const composerSignedPdfUrl = contractData.composerSignedPdfUrl || pub.signedContractUrl || null;
+            const fileName = composerSignedPdfUrl ? composerSignedPdfUrl.split('/').pop() : `${pub.composition_title}_signed.pdf`;
+
+            results.push({
+                agreement_id: pub.id + 100000, // Offset to avoid conflict with standard agreement IDs
+                agreement_title: pub.composition_title,
+                agreements_file_name: fileName,
+                agreements_file_path: composerSignedPdfUrl,
+                document_description: pub.composition_description || null,
+                agreement_type: "Signature",
+                badges: [],
+                assigned_via: "user",
+                status: "signed",
+                signature_details: {
+                    id: pub.id + 100000,
+                    user_id: userId,
+                    document_id: pub.id + 100000,
+                    status: "signed",
+                    signature_file_name: fileName,
+                    signature_file_url: composerSignedPdfUrl,
+                    badge: "[]",
+                    history: JSON.stringify([
+                        {
+                            action: "accepted",
+                            timestamp: pub.finalContractTime || pub.published_at || new Date().toISOString(),
+                            user_id: userId
+                        }
+                    ]),
+                    admin_comment: "",
+                    created_at: pub.finalContractTime || pub.published_at || new Date(),
+                    updated_at: pub.finalContractTime || pub.published_at || new Date(),
+                    deleted_at: null,
+                    adminSignatureUrl: contractData.adminSignatureUrl || null,
+                    adminSignedPdfUrl: contractData.adminSignedPdfUrl || null,
+                    adminSignedDate: contractData.adminSignedDate || null
+                },
+                signature_position: null,
+                uploaded_on: pub.published_at || pub.created_at || new Date(),
+                adminSignatureUrl: contractData.adminSignatureUrl || null,
+                adminSignedPdfUrl: contractData.adminSignedPdfUrl || null,
+                adminSignedDate: contractData.adminSignedDate || null
+            });
         }
 
         // Sort by uploaded_on descending

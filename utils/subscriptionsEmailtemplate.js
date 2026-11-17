@@ -75,7 +75,7 @@ Order details:
 - Next renewal: ${formatDate(endDate)}
 
 Manage your subscription anytime here:
-${process.env.FRONTEND_URL || 'https://yourapp.com'}/manage-subscription
+${process.env.FRONTEND_URL || 'https://yourapp.com'}
 
 If you need help, contact ${process.env.SUPPORT_MAIL}. We are so happy that you have joined us in the service of the Church.
 
@@ -150,7 +150,7 @@ function subscriptionExpiredTemplate({
   firstName = 'User',
   planName = 'Paid Plan',
   expiryDate = new Date(),
-  manageSubscriptionLink = `${process.env.FRONTEND_URL}/manage-subscription`,
+  manageSubscriptionLink = `${process.env.FRONTEND_URL}`,
   supportEmail = process.env.SUPPORT_MAIL
 }) {
   const formatDate = (d) =>
@@ -190,6 +190,74 @@ To restore access, renew your subscription here:
 ${manageSubscriptionLink}
 
 If you believe this is an error, reply to this email or contact ${supportEmail}.
+
+God bless,
+— Simply Liturgical Team
+  `.trim();
+
+  return { subject, html, text };
+}
+
+/**
+ * Subscription expiring SOON reminder (used for both the
+ * "1 month left" and "1 week left" reminder emails — pass
+ * daysRemaining to control the copy/subject).
+ */
+function subscriptionExpiringSoonTemplate({
+  firstName = 'User',
+  planName = 'Paid Plan',
+  expiryDate,
+  daysRemaining = 30,
+  manageSubscriptionLink = `${process.env.FRONTEND_URL}`,
+  supportEmail = process.env.SUPPORT_MAIL
+}) {
+  const formatDate = (d) =>
+    new Date(d).toLocaleDateString('en-US', {
+      month: '2-digit',
+      day: '2-digit',
+      year: 'numeric',
+      timeZone: 'UTC'
+    });
+
+  const friendlyWindow =
+    daysRemaining >= 28 ? '1 month' :
+    daysRemaining >= 6 ? '1 week' :
+    `${daysRemaining} day${daysRemaining === 1 ? '' : 's'}`;
+
+  const subject = `Your subscription expires in ${friendlyWindow} — action may be needed`;
+
+  const html = `
+  <div style="font-family: Arial, Helvetica, sans-serif; font-size:14px; line-height:1.6; color:#222;">
+    <p>Hi ${firstName},</p>
+
+    <p>
+      This is a friendly reminder that your Simply Liturgical subscription
+      (<strong>${planName}</strong>) is set to expire in <strong>${friendlyWindow}</strong>,
+      on <strong>${formatDate(expiryDate)}</strong>.
+    </p>
+
+    <p>
+      To avoid losing access to your current plan's features, you can renew anytime here:<br/>
+      <a href="${manageSubscriptionLink}">${manageSubscriptionLink}</a>
+    </p>
+
+    <p>
+      If you have any questions or need help, contact <a href="mailto:${supportEmail}">${supportEmail}</a>.
+    </p>
+
+    <p>God bless,<br/>— Simply Liturgical Team</p>
+  </div>
+  `;
+
+  const text = `
+Hi ${firstName},
+
+This is a friendly reminder that your Simply Liturgical subscription (${planName}) is set to expire in ${friendlyWindow}, on ${formatDate(expiryDate)}.
+
+To avoid losing access to your current plan's features, you can renew anytime here:
+${manageSubscriptionLink}
+
+If you have any questions or need help, contact ${supportEmail}.
 
 God bless,
 — Simply Liturgical Team
@@ -276,5 +344,6 @@ module.exports = {
   subscriptionCreatedTemplate,
   subscriptionCancelledTemplate,
   subscriptionExpiredTemplate,
+  subscriptionExpiringSoonTemplate,
   subscriptionConfirmationTemplate
 };

@@ -2827,9 +2827,16 @@ router.post('/members/:id/create-credentials', auth, async (req, res) => {
       planPermissions = JSON.parse(planPermissions);
     }
 
-    // 👉 Sub-user ke liye usually permissions copy hoti hain
-    // (future me custom bhi kar sakte ho)
-    const userPlanPermissions = planPermissions || null;
+    // 👉 Sub-user ke liye permissions copy hoti hain + Full access to Community
+    const userPlanPermissions = planPermissions ? JSON.parse(JSON.stringify(planPermissions)) : {};
+    if (!userPlanPermissions["Community"]) {
+        userPlanPermissions["Community"] = {};
+    }
+    userPlanPermissions["Community"]["Feed"] = "x";
+    userPlanPermissions["Community"]["Feeds"] = "x";
+    userPlanPermissions["Community"]["Discussions"] = "x";
+    userPlanPermissions["Community"]["My Groups"] = "x";
+    userPlanPermissions["Community"]["Prayer"] = "x";
 
     // =========================
     // 🔹 UPDATE USER (PASSWORD + PERMISSIONS)

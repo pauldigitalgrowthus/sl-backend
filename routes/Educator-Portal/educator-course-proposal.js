@@ -7,7 +7,7 @@ const slugify = require("slugify");
 const {
     sendEducatorNotification,
     EDUCATOR_NOTIFICATION_EVENTS
-} = require("./utils/educatorNotificationService");
+} = require("./utils/educatorNotificationServices");
 
 const router = express.Router();
 

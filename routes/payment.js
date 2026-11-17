@@ -8,6 +8,7 @@ const { getMySQLConnection } = require('../config/mysql');
 const { sendEmail } = require("../utils/SendMailer");
 const { createAndDeliverNotification } = require("../utils/notificationUtils")
 const { subscriptionCreatedTemplate } = require("../utils/subscriptionsEmailtemplate")
+const { recordMusicALaCarteEarning, recordEducatorALaCarteEarning, distributeSubscriptionRevenueRealtime } = require('../utils/royaltyEngine');
 
 const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -1897,6 +1898,22 @@ async function activateUserSubscription(userId, planId, session, mysqlConnection
   }
 
   // ----------------------------
+  // 🔥 ROYALTY ENGINE: distribute Music/Academy/Documents pools
+  // immediately, based on this plan's revenue allocation % and
+  // current cumulative usage. Never blocks subscription activation.
+  // ----------------------------
+  try {
+    await distributeSubscriptionRevenueRealtime({
+      mysql: mysqlConnection,
+      planId,
+      planPrice: plan.price,
+      subscriberUserId: userId
+    });
+  } catch (err) {
+    console.error('❌ Real-time royalty distribution failed for subscription:', err.message);
+  }
+
+  // ----------------------------
   // Upsert stripe_subscriptions mapping (if stripe subscription id exists)
   // ----------------------------
   if (stripeSubscriptionId) {
@@ -2333,6 +2350,18 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
               user_id: userId
             });
 
+            // 🔥 ROYALTY ENGINE: deduct ICEL/USCCB/CCD, split 30% to composer
+            // Never blocks the purchase flow - errors are logged internally.
+            await recordMusicALaCarteEarning({
+              mysql,
+              musicPublicationId: musicId,
+              buyerUserId: userId,
+              salePrice: price,
+              transactionId: transactionId,
+              stripeSessionId: session.id,
+              paymentMethod: 'stripe'
+            });
+
           }
           console.log("📚 User Music Library inserted items:", JSON.stringify(insertedLibraryItems, null, 2));
 
@@ -2358,6 +2387,115 @@ router.post("/webhook", express.raw({ type: "application/json" }), async (req, r
             });
           } catch (e) {
             console.log("❌ Email error:", e.message);
+          }
+
+        }
+
+        // ============================================
+        // 🎓 COURSE CART PURCHASE (Academy - educator royalty)
+        // ------------------------------------------------------------
+        // Reliable server-side fallback for the same flow that
+        // routes/Educator-Portal/educator-cart.js's GET /verify-session
+        // does client-side. Both are idempotent (UNIQUE KEY on
+        // course_enrollments(course_id, student_id) + a payment_id
+        // UNIQUE KEY on course_purchases), so whichever fires first
+        // does the real work and the other just no-ops.
+        // ============================================
+        else if (type === "cart_purchase") {
+
+          const userId = Number(metadata.user_id);
+          console.log("🎓 Course Cart Purchase:", userId);
+
+          let courseIds = [];
+          try {
+            courseIds = JSON.parse(metadata.course_ids || "[]");
+          } catch {
+            courseIds = [];
+          }
+
+          if (!courseIds.length) {
+            console.log("❌ No course_ids found in cart_purchase metadata");
+            break;
+          }
+
+          const [[existingCheckout]] = await mysql.execute(
+            `SELECT id, status FROM cart_checkout_sessions WHERE stripe_session_id = ? LIMIT 1`,
+            [session.id]
+          );
+
+          if (existingCheckout && existingCheckout.status === "completed") {
+            console.log("⚠️ Cart checkout session already processed:", session.id);
+            break;
+          }
+
+          await mysql.execute(
+            `UPDATE cart_checkout_sessions SET status = 'completed', updated_at = NOW() WHERE stripe_session_id = ?`,
+            [session.id]
+          );
+
+          const perCoursePaid = typeof session.amount_total === "number"
+            ? session.amount_total / 100 / courseIds.length
+            : null;
+
+          for (const courseId of courseIds) {
+            const [[course]] = await mysql.execute(
+              `SELECT id, educator_id, course_title, price, currency FROM courses WHERE id = ? LIMIT 1`,
+              [courseId]
+            );
+            if (!course) continue;
+
+            const [[existingEnrollment]] = await mysql.execute(
+              `SELECT id FROM course_enrollments WHERE course_id = ? AND student_id = ? LIMIT 1`,
+              [courseId, userId]
+            );
+
+            if (existingEnrollment) continue; // already enrolled via verify-session (or a prior webhook retry)
+
+            const coursePrice = perCoursePaid ?? course.price;
+
+            try {
+              await mysql.execute(
+                `INSERT INTO course_purchases
+                    (course_id, student_id, payment_provider, payment_id, amount, currency, payment_status)
+                 VALUES (?, ?, 'stripe', ?, ?, ?, 'paid')`,
+                [
+                  courseId, userId,
+                  `${session.payment_intent || session.id}:${courseId}`,
+                  coursePrice, session.currency || course.currency
+                ]
+              );
+            } catch (err) {
+              // payment_id UNIQUE constraint - verify-session already recorded this purchase
+              console.warn("⚠️ course_purchases insert skipped (likely already recorded):", err.message);
+            }
+
+            const [enrollResult] = await mysql.execute(
+              `INSERT INTO course_enrollments (course_id, student_id, source_type, price_at_enrollment) VALUES (?, ?, 'a_la_carte', ?)`,
+              [courseId, userId, coursePrice]
+            );
+
+            await mysql.execute(
+              `UPDATE courses SET total_students = total_students + 1 WHERE id = ?`,
+              [courseId]
+            );
+
+            await mysql.execute(
+              `DELETE FROM course_cart WHERE course_id = ? AND student_id = ?`,
+              [courseId, userId]
+            );
+
+            // 🔥 ROYALTY ENGINE: deduct ICEL/USCCB/CCD, split 30% to educator
+            await recordEducatorALaCarteEarning({
+              mysql,
+              courseId,
+              buyerUserId: userId,
+              salePrice: coursePrice,
+              transactionId: session.payment_intent || null,
+              stripeSessionId: session.id,
+              paymentMethod: 'stripe'
+            });
+
+            console.log(`🎉 Enrolled user ${userId} in course ${courseId} via webhook`);
           }
 
         }

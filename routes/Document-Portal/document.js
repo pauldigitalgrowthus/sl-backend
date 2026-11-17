@@ -4,6 +4,7 @@ const { getMySQLConnection } = require("../../config/mysql");
 const { successResponse, errorResponse } = require("../../utils/response");
 const { documentUpload, deleteFileFromS3 } = require("../../config/s3");
 const { extractTOCFromPDF } = require("../../utils/extractTOC");
+const { logDocumentAccess } = require("../../utils/royaltyEngine");
 
 const router = express.Router();
 
@@ -142,6 +143,9 @@ router.post("/documents/active", auth, async (req, res) => {
              ON DUPLICATE KEY UPDATE active = TRUE`,
             [userId, document_id]
         );
+
+        // 🔥 ROYALTY ENGINE: log usage for subscription pro-rata Document pool
+        await logDocumentAccess({ mysql: db, userId, documentId: document_id });
 
         return successResponse(res, { document_id }, "Active document set successfully ✅");
     } catch (err) {

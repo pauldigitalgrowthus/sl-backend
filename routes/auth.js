@@ -10,6 +10,15 @@ const { sendEmail } = require('../utils/SendMailer');
 const { createAndDeliverNotification } = require('../utils/notificationUtils')
 const router = express.Router();
 
+// =============================================================
+// 🗂️ In-memory job store for the ActiveCampaign bulk-sync route.
+// Bulk syncing can take longer than the server's global 120s request
+// timeout, so that route runs the sync in the background and returns
+// immediately — progress is tracked here and polled via a status route.
+// Lives only in process memory (no DB change) and resets on restart.
+// =============================================================
+const acSyncJobs = new Map();
+
 const createDefaultUserCollections = async (mysqlConnection, userId) => {
   try {
     const defaultCollections = [
@@ -72,6 +81,272 @@ const generateToken = (userId) => {
     { expiresIn: '1d' }
   );
 };
+
+/**
+ * Ensure Ministers, Members, and Managers have full Community permissions in their permission payload
+ */
+const ensureMemberAndMinisterCommunityPermissions = async (user, mysqlConnection) => {
+  if (!user || !user.id) return user;
+
+  let isMinisterOrMember = (
+    user.user_type === 'sub_user' ||
+    user.user_type === 'manager' ||
+    user.role === 'member' ||
+    user.role === 'manager'
+  );
+
+  if (!isMinisterOrMember && mysqlConnection) {
+    try {
+      const [ministers] = await mysqlConnection.execute(
+        'SELECT id FROM planner_ministers WHERE (linked_user_id = ? OR email = ?) AND deleted_at IS NULL LIMIT 1',
+        [user.id, user.email || '']
+      );
+      if (ministers && ministers.length > 0) isMinisterOrMember = true;
+    } catch (e) {}
+
+    if (!isMinisterOrMember) {
+      try {
+        const [members] = await mysqlConnection.execute(
+          'SELECT id FROM community_members WHERE (user_id = ? OR email = ?) AND deleted_at IS NULL LIMIT 1',
+          [user.id, user.email || '']
+        );
+        if (members && members.length > 0) isMinisterOrMember = true;
+      } catch (e) {}
+    }
+  }
+
+  if (isMinisterOrMember) {
+    if (!user.plan_permissions || typeof user.plan_permissions !== 'object') {
+      user.plan_permissions = {};
+    }
+    if (!user.plan_permissions.Community || typeof user.plan_permissions.Community !== 'object') {
+      user.plan_permissions.Community = {};
+    }
+
+    user.plan_permissions.Community.Feed = 'x';
+    user.plan_permissions.Community.Feeds = 'x';
+    user.plan_permissions.Community.Discussions = 'x';
+    user.plan_permissions.Community['My Groups'] = 'x';
+    user.plan_permissions.Community.Groups = 'x';
+    user.plan_permissions.Community.Prayer = 'x';
+
+    if (!user.plan_permissions['SL Portals'] || typeof user.plan_permissions['SL Portals'] !== 'object') {
+      user.plan_permissions['SL Portals'] = {};
+    }
+    user.plan_permissions['SL Portals'].Community = {
+      Feed: 'x',
+      Feeds: 'x',
+      Discussions: 'x',
+      'My Groups': 'x',
+      Groups: 'x',
+      Prayer: 'x'
+    };
+
+    if (user.permissions && typeof user.permissions === 'object') {
+      if (!user.permissions.Community) user.permissions.Community = {};
+      user.permissions.Community.Feed = 'x';
+      user.permissions.Community.Feeds = 'x';
+      user.permissions.Community.Discussions = 'x';
+      user.permissions.Community['My Groups'] = 'x';
+      user.permissions.Community.Groups = 'x';
+      user.permissions.Community.Prayer = 'x';
+
+      if (!user.permissions['SL Portals']) user.permissions['SL Portals'] = {};
+      user.permissions['SL Portals'].Community = {
+        Feed: 'x',
+        Feeds: 'x',
+        Discussions: 'x',
+        'My Groups': 'x',
+        Groups: 'x',
+        Prayer: 'x'
+      };
+    }
+  }
+
+  return user;
+};
+
+// =============================================================
+// 🏷️ ActiveCampaign Sync Helpers
+// =============================================================
+// Contact: create/update via /contact/sync (upsert by email — no duplicates)
+async function syncActiveCampaignContact({ email, firstName, lastName, phone }) {
+  try {
+    const syncResponse = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/contact/sync`, {
+      method: "POST",
+      headers: {
+        "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        contact: {
+          email,
+          firstName: firstName || "",
+          lastName: lastName || "",
+          ...(phone ? { phone } : {}),
+        },
+      }),
+    });
+
+    const syncData = await syncResponse.json();
+
+    if (syncResponse.ok) {
+      return syncData.contact;
+    }
+
+    console.error(`Failed to sync AC contact "${email}"`, syncData);
+    return null;
+  } catch (err) {
+    console.error(`Error syncing AC contact "${email}":`, err.message);
+    return null;
+  }
+}
+
+// Attach an existing tag to a contact (idempotent — 422 "already tagged" counts as success)
+async function addTagToActiveCampaignContact(contactId, tagId) {
+  if (!contactId || !tagId) return false;
+  try {
+    const response = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/contactTags`, {
+      method: "POST",
+      headers: {
+        "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        contactTag: {
+          contact: contactId,
+          tag: tagId,
+        },
+      }),
+    });
+
+    if (response.ok || response.status === 422) {
+      return true;
+    }
+
+    const data = await response.json().catch(() => ({}));
+    console.error(`Failed to add tag ${tagId} to contact ${contactId}`, data);
+    return false;
+  } catch (err) {
+    console.error(`Error adding tag ${tagId} to contact ${contactId}:`, err.message);
+    return false;
+  }
+}
+
+// Create a brand-new tag in ActiveCampaign
+async function createActiveCampaignTag(tagName, description) {
+  try {
+    const createResponse = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags`, {
+      method: "POST",
+      headers: {
+        "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+        "Content-Type": "application/json",
+      },
+      body: JSON.stringify({
+        tag: {
+          tag: tagName,
+          tagType: "contact",
+          description,
+        },
+      }),
+    });
+
+    const createData = await createResponse.json();
+
+    if (createResponse.ok) {
+      return createData.tag;
+    }
+
+    console.error(`Failed to create AC tag "${tagName}"`, createData);
+    return null;
+  } catch (err) {
+    console.error(`Error creating AC tag "${tagName}":`, err.message);
+    return null;
+  }
+}
+
+// Get this role's saved AC tag ID (role_permissions.ac_tag_id) or create one & save it
+async function getOrCreateRoleTag(mysqlConnection, roleName) {
+  try {
+    const [rows] = await mysqlConnection.execute(
+      'SELECT id, ac_tag_id FROM role_permissions WHERE role_name = ?',
+      [roleName]
+    );
+
+    const roleRow = rows[0] || null;
+
+    if (roleRow?.ac_tag_id) {
+      return { id: roleRow.ac_tag_id };
+    }
+
+    // No role_permissions row (or no tag saved yet) — create the tag directly
+    const tag = await createActiveCampaignTag(roleName, `${roleName} role`);
+
+    if (tag && roleRow) {
+      await mysqlConnection.execute(
+        'UPDATE role_permissions SET ac_tag_id = ? WHERE id = ?',
+        [tag.id, roleRow.id]
+      );
+    }
+
+    return tag;
+  } catch (err) {
+    console.error(`Error resolving AC tag for role "${roleName}":`, err.message);
+    return null;
+  }
+}
+
+// Get this plan's saved AC tag ID (plans.ac_tag_id) or create one & save it
+async function getOrCreatePlanTag(mysqlConnection, planName, planId) {
+  try {
+    const [rows] = await mysqlConnection.execute(
+      'SELECT ac_tag_id FROM plans WHERE id = ?',
+      [planId]
+    );
+
+    const existingTagId = rows[0]?.ac_tag_id;
+
+    if (existingTagId) {
+      return { id: existingTagId };
+    }
+
+    const tag = await createActiveCampaignTag(planName, `Plan: ${planName}`);
+
+    if (tag) {
+      await mysqlConnection.execute(
+        'UPDATE plans SET ac_tag_id = ? WHERE id = ?',
+        [tag.id, planId]
+      );
+    }
+
+    return tag;
+  } catch (err) {
+    console.error(`Error resolving AC tag for plan "${planName}":`, err.message);
+    return null;
+  }
+}
+
+// Fire-and-forget wrapper: call this from a route right before you respond
+// (register, profile update, admin user update, etc.) so the ActiveCampaign
+// sync runs in the background and never delays or breaks the actual request.
+// `syncUserToActiveCampaign` itself is defined further down but is hoisted
+// since it's a function declaration, so it's safe to reference here.
+function triggerActiveCampaignSync(mysqlConnection, userId, context = '') {
+  syncUserToActiveCampaign(mysqlConnection, userId)
+    .then((result) => {
+      if (result.success) {
+        console.log(
+          `✅ [AC AUTO-SYNC${context ? ':' + context : ''}] User ${userId} synced — tags: ${result.appliedTags.join(', ') || 'none'
+          }${result.failedTags.length ? `, failed: ${result.failedTags.join(', ')}` : ''}`
+        );
+      } else {
+        console.error(`⚠️ [AC AUTO-SYNC${context ? ':' + context : ''}] User ${userId} sync failed:`, result.error);
+      }
+    })
+    .catch((err) => {
+      console.error(`⚠️ [AC AUTO-SYNC${context ? ':' + context : ''}] User ${userId} sync threw:`, err.message);
+    });
+}
 
 async function regeneratePermissionsForPlanUsers(planId, mysqlConnection) {
   try {
@@ -440,7 +715,7 @@ router.post('/register', async (req, res) => {
       ? JSON.parse(user.plan_permissions)
       : {};
 
-    createDefaultUserCollections(mysqlConnection, userId);
+    // createDefaultUserCollections(mysqlConnection, userId);
 
     /* --------------------------------------------------
        🔟 TOKEN
@@ -466,6 +741,9 @@ router.post('/register', async (req, res) => {
       console.warn('⚠️ Registration email failed (non-blocking):', err.message);
     }
 
+
+    // 🔗 Auto-sync new user to ActiveCampaign (non-blocking — doesn't delay the response)
+    triggerActiveCampaignSync(mysqlConnection, userId, 'register');
 
     return successResponse(
       res,
@@ -624,6 +902,8 @@ router.post('/login', async (req, res) => {
     user.custom_permissions = user.custom_permissions ? JSON.parse(user.custom_permissions) : null;
     user.badges = user.badges ? JSON.parse(user.badges) : null;
     user.permissions = user.permissions ? JSON.parse(user.permissions) : null;
+
+    await ensureMemberAndMinisterCommunityPermissions(user, mysqlConnection);
 
 
 
@@ -859,6 +1139,9 @@ router.put('/profile', auth, async (req, res) => {
     user.plan_permissions = user.plan_permissions ? JSON.parse(user.plan_permissions) : null;
     user.custom_permissions = user.custom_permissions ? JSON.parse(user.custom_permissions) : null;
     user.badges = user.badges ? JSON.parse(user.badges) : null;
+
+    // 🔗 Re-sync to ActiveCampaign (non-blocking) — name/phone may have changed
+    triggerActiveCampaignSync(mysqlConnection, req.user.id, 'profile-update');
 
     successResponse(res, {
       user
@@ -1447,6 +1730,8 @@ router.get('/getDetails', auth, async (req, res) => {
     user.badges = parseJSON(user.badges);
     user.permissions = parseJSON(user.permissions);
 
+    await ensureMemberAndMinisterCommunityPermissions(user, mysqlConnection);
+
     // ------------------------------------
     // Check Parish Info
     // ------------------------------------
@@ -1861,7 +2146,7 @@ router.put('/user/:id', [auth], async (req, res) => {
     const {
       firstName, lastName, bio, phone, websiteUrl, twitterUrl, address,
       country, stateProvince, city, postalCode, language, timezone,
-      is_active, is_verified, is_composer, badges, password
+      is_active, is_verified, is_composer, is_educator, badges, password
     } = req.body;
 
     const mysqlConnection = getMySQLConnection();
@@ -1921,6 +2206,7 @@ router.put('/user/:id', [auth], async (req, res) => {
     if (is_active !== undefined) update(is_active ? 1 : 0, 'is_active');
     if (is_verified !== undefined) update(is_verified ? 1 : 0, 'is_verified');
     if (is_composer !== undefined) update(is_composer ? 1 : 0, 'is_composer');
+    if (is_educator !== undefined) update(is_educator ? 1 : 0, 'is_educator');
 
     /* ==============================
        3️⃣ BADGES LOGIC
@@ -2028,6 +2314,40 @@ router.put('/user/:id', [auth], async (req, res) => {
 
               finalPermissions['SL Portals']['Composer'] =
                 composerPerms['SL Portals']['Composer'];
+            }
+          }
+        }
+
+        /* ==========================================
+           ðŸ”¥ IMPORTANT PART:
+           If Educator badge + is_educator true
+           â†’ ADD SL Portal Educator permissions
+        ========================================== */
+
+        const hasEducatorBadge = badgeNames.some(
+          b => b.toLowerCase() === 'educator'
+        );
+
+        if (hasEducatorBadge && is_educator === true) {
+
+          const [educatorRole] = await mysqlConnection.execute(
+            `SELECT permissions FROM role_permissions WHERE role_name = 'Educator' LIMIT 1`
+          );
+
+          if (educatorRole.length > 0) {
+            const educatorPerms = JSON.parse(educatorRole[0].permissions || '{}');
+
+            if (
+              educatorPerms['SL Portals'] &&
+              educatorPerms['SL Portals']['Educator']
+            ) {
+
+              if (!finalPermissions['SL Portals']) {
+                finalPermissions['SL Portals'] = {};
+              }
+
+              finalPermissions['SL Portals']['Educator'] =
+                educatorPerms['SL Portals']['Educator'];
             }
           }
         }
@@ -2165,6 +2485,9 @@ router.put('/user/:id', [auth], async (req, res) => {
       }
     }
 
+    // 🔗 Re-sync to ActiveCampaign (non-blocking) — badges/role/name/phone may have changed
+    triggerActiveCampaignSync(mysqlConnection, userId, 'admin-user-update');
+
     return successResponse(res, { user }, 'User updated successfully');
 
   } catch (error) {
@@ -2258,6 +2581,9 @@ router.put('/user/:id/restore', [
        WHERE id = ?`,
       [userId]
     );
+
+    // 🔗 Re-sync to ActiveCampaign (non-blocking) — their badge tags are relevant again
+    triggerActiveCampaignSync(mysqlConnection, userId, 'restore');
 
     return successResponse(res, null, 'User restored successfully');
 
@@ -2418,5 +2744,233 @@ router.post('/invite', auth, async (req, res) => {
   }
 });
 
+
+// Sync ONE user's contact + role/plan tags to ActiveCampaign.
+// Returns { success, contactId, email, appliedTags, failedTags } or { success:false, error }
+// Shared by both the single-user and bulk-sync routes below.
+async function syncUserToActiveCampaign(mysqlConnection, userId) {
+  const [users] = await mysqlConnection.execute(
+    `SELECT id, first_name, last_name, email, phone, badges,
+            current_plan_id, plan_status
+     FROM users WHERE id = ?`,
+    [userId]
+  );
+
+  if (!users.length) {
+    return { success: false, userId, error: 'User not found' };
+  }
+
+  const user = users[0];
+
+  let badges = [];
+  try {
+    badges = user.badges ? JSON.parse(user.badges) : [];
+  } catch {
+    badges = [];
+  }
+
+  // Kelly's Note 1: never sync "Manager"/"Minister" badges to ActiveCampaign —
+  // those are for the Subscription Admin's internal use only.
+  const excludedBadgePattern = /manager|minister/i;
+  const syncableBadges = badges.filter(
+    (b) => b && !excludedBadgePattern.test(b)
+  );
+
+  // Resolve the user's current plan name (only if the plan is active)
+  let planName = null;
+  if (user.current_plan_id && user.plan_status === 'active') {
+    const [plans] = await mysqlConnection.execute(
+      'SELECT name FROM plans WHERE id = ? AND is_active = TRUE',
+      [user.current_plan_id]
+    );
+    if (plans.length) planName = plans[0].name;
+  }
+
+  // Create/update the ActiveCampaign contact (upsert by email — no duplicates)
+  const contact = await syncActiveCampaignContact({
+    email: user.email,
+    firstName: user.first_name,
+    lastName: user.last_name,
+    phone: user.phone,
+  });
+
+  if (!contact) {
+    return { success: false, userId, email: user.email, error: 'Failed to sync contact to ActiveCampaign' };
+  }
+
+  // Resolve (or create) a tag for every badge + the plan, then attach to the contact
+  const appliedTags = [];
+  const failedTags = [];
+
+  for (const badgeName of syncableBadges) {
+    const tag = await getOrCreateRoleTag(mysqlConnection, badgeName);
+    if (tag) {
+      const ok = await addTagToActiveCampaignContact(contact.id, tag.id);
+      (ok ? appliedTags : failedTags).push(badgeName);
+    } else {
+      failedTags.push(badgeName);
+    }
+  }
+
+  if (planName) {
+    const tag = await getOrCreatePlanTag(mysqlConnection, planName, user.current_plan_id);
+    if (tag) {
+      const ok = await addTagToActiveCampaignContact(contact.id, tag.id);
+      (ok ? appliedTags : failedTags).push(planName);
+    } else {
+      failedTags.push(planName);
+    }
+  }
+
+  return {
+    success: true,
+    userId: user.id,
+    contactId: contact.id,
+    email: user.email,
+    appliedTags,
+    failedTags,
+  };
+}
+
+// @route   POST /api/auth/sync-active-campaign/:id
+// @desc    Create/update this user's ActiveCampaign contact and apply
+//          their current Role (badge) + Plan tags. Pulls the same
+//          plan + badges data the login API returns.
+// @access  Private (SL Team/Admin)
+router.post('/sync-active-campaign/:id', [
+  auth,
+  requireSLTeamWithTypes(['superadmin', 'admin'])
+], async (req, res) => {
+  try {
+    const { id } = req.params;
+    const mysqlConnection = getMySQLConnection();
+
+    const result = await syncUserToActiveCampaign(mysqlConnection, id);
+
+    if (!result.success) {
+      return errorResponse(res, result.error || 'Failed to sync user to ActiveCampaign', result.error === 'User not found' ? 404 : 502);
+    }
+
+    return successResponse(
+      res,
+      {
+        contactId: result.contactId,
+        email: result.email,
+        appliedTags: result.appliedTags,
+        failedTags: result.failedTags,
+      },
+      'User synced to ActiveCampaign'
+    );
+  } catch (err) {
+    console.error('❌ Sync ActiveCampaign error:', err);
+    return errorResponse(res, 'Failed to sync user to ActiveCampaign');
+  }
+});
+
+// @route   POST /api/auth/sync-active-campaign-all
+// @desc    Bulk-sync ALL users' ActiveCampaign contacts + Role/Plan tags.
+//          Runs as a BACKGROUND JOB — this responds immediately with a
+//          jobId (bulk syncing can easily exceed the server's 120s
+//          global request timeout). Poll progress with:
+//          GET /api/auth/sync-active-campaign-all/status/:jobId
+//          Optional body: { onlyActive: true } → only is_active=1,
+//          deleted_at IS NULL users (default: true)
+// @access  Private (SL Team/Admin)
+router.post('/sync-active-campaign-all', [
+  auth,
+  requireSLTeamWithTypes(['superadmin', 'admin'])
+], async (req, res) => {
+  try {
+    const mysqlConnection = getMySQLConnection();
+    const onlyActive = req.body?.onlyActive !== false; // default true
+
+    const [users] = await mysqlConnection.execute(
+      onlyActive
+        ? `SELECT id FROM users WHERE is_active = 1 AND deleted_at IS NULL`
+        : `SELECT id FROM users`
+    );
+
+    const jobId = `ac-sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    const job = {
+      jobId,
+      status: 'running', // 'running' | 'completed' | 'failed'
+      total: users.length,
+      processed: 0,
+      succeeded: 0,
+      failed: 0,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      startedBy: req.user?.id || null,
+      results: { synced: [], failed: [] },
+    };
+    acSyncJobs.set(jobId, job);
+
+    // 🚀 Respond immediately — the sync itself runs after this
+    successResponse(
+      res,
+      {
+        jobId,
+        total: job.total,
+        statusUrl: `/api/auth/sync-active-campaign-all/status/${jobId}`,
+      },
+      `Bulk sync started for ${job.total} user(s). Poll the statusUrl for progress.`,
+      202
+    );
+
+    // 🔄 Run the actual sync in the background (not awaited by the response above)
+    setImmediate(async () => {
+      console.log(`🚀 [BULK AC SYNC:${jobId}] Starting sync for ${users.length} user(s)...`);
+
+      for (const { id: userId } of users) {
+        try {
+          const result = await syncUserToActiveCampaign(mysqlConnection, userId);
+          job.processed += 1;
+
+          if (result.success) {
+            job.succeeded += 1;
+            job.results.synced.push({
+              userId: result.userId,
+              email: result.email,
+              appliedTags: result.appliedTags,
+              failedTags: result.failedTags,
+            });
+          } else {
+            job.failed += 1;
+            job.results.failed.push({ userId, error: result.error });
+          }
+        } catch (userErr) {
+          console.error(`❌ [BULK AC SYNC:${jobId}] Error syncing user ${userId}:`, userErr.message);
+          job.processed += 1;
+          job.failed += 1;
+          job.results.failed.push({ userId, error: userErr.message });
+        }
+      }
+
+      job.status = 'completed';
+      job.finishedAt = new Date().toISOString();
+      console.log(`✅ [BULK AC SYNC:${jobId}] Done. Synced ${job.succeeded}/${job.total}, failed ${job.failed}.`);
+    });
+  } catch (err) {
+    console.error('❌ Bulk sync ActiveCampaign error:', err);
+    return errorResponse(res, 'Failed to start bulk sync to ActiveCampaign');
+  }
+});
+
+// @route   GET /api/auth/sync-active-campaign-all/status/:jobId
+// @desc    Check progress/result of a bulk-sync job started above
+// @access  Private (SL Team/Admin)
+router.get('/sync-active-campaign-all/status/:jobId', [
+  auth,
+  requireSLTeamWithTypes(['superadmin', 'admin'])
+], async (req, res) => {
+  const job = acSyncJobs.get(req.params.jobId);
+
+  if (!job) {
+    return errorResponse(res, 'Job not found (it may have finished and the server since restarted)', 404);
+  }
+
+  return successResponse(res, job, 'Bulk sync job status');
+});
 
 module.exports = router;

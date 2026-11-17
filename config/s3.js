@@ -196,7 +196,7 @@ const agreementUpload = multer({
     }
   },
   limits: {
-    fileSize: 5 * 1024 * 1024 // 5MB limit
+    fileSize: 50 * 1024 * 1024 // 50MB limit
   },
   storage: multerS3({
     s3: s3Client,
@@ -505,6 +505,42 @@ const libraryImageUpload = multer({
         const timestamp = Date.now();
         const fileExtension = file.originalname.split('.').pop();
         const fileName = `sl-music-backend/anonymous/library-images/${timestamp}-${Math.random().toString(36).substring(7)}.${fileExtension}`;
+        cb(null, fileName);
+      }
+    }
+  })
+});
+
+const communityPortalUpload = multer({
+  fileFilter: (req, file, cb) => {
+    const allowedImageTypes = {
+      'image/jpeg': true,
+      'image/png': true,
+      'image/gif': true,
+      'image/webp': true
+    };
+
+    if (allowedImageTypes[file.mimetype]) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid file type. Only JPEG, PNG, GIF, and WebP images are allowed.'), false);
+    }
+  },
+  limits: {
+    fileSize: 8 * 1024 * 1024, // 8MB limit per image
+    files: 6 // up to 6 images per post/message
+  },
+  storage: multerS3({
+    s3: s3Client,
+    bucket: BUCKET_NAME,
+    key: function (req, file, cb) {
+      if (req.user) {
+        const fileName = generateFileName(req, 'community-portal', file.originalname);
+        cb(null, fileName);
+      } else {
+        const timestamp = Date.now();
+        const fileExtension = file.originalname.split('.').pop();
+        const fileName = `sl-music-backend/anonymous/community-portal/${timestamp}-${Math.random().toString(36).substring(7)}.${fileExtension}`;
         cb(null, fileName);
       }
     }
@@ -1031,6 +1067,41 @@ const courseThumbnailUpload = multer({
   })
 });
 
+const deductionEntityLogoUpload = multer({
+  fileFilter: (req, file, cb) => {
+    const allowedLogoTypes = {
+      'image/jpeg': true,
+      'image/jpg': true,
+      'image/png': true,
+      'image/gif': true,
+      'image/webp': true,
+      'image/svg+xml': true
+    };
+
+    if (allowedLogoTypes[file.mimetype]) {
+      cb(null, true);
+    } else {
+      cb(new Error('Invalid logo file type. Only JPEG, JPG, PNG, GIF, WebP, and SVG images are allowed.'), false);
+    }
+  },
+  limits: {
+    fileSize: 10 * 1024 * 1024
+  },
+  storage: multerS3({
+    s3: s3Client,
+    bucket: BUCKET_NAME,
+    contentType: multerS3.AUTO_CONTENT_TYPE,
+    key: function (req, file, cb) {
+      const timestamp = Date.now();
+      const cleanFileName = file.originalname
+        .replace(/\s+/g, '-')
+        .replace(/[^a-zA-Z0-9.-]/g, '');
+      const filePath = `sl-music-backend/deduction-entities/logos/${timestamp}-${cleanFileName}`;
+      cb(null, filePath);
+    }
+  })
+});
+
 module.exports = {
   s3: s3Client,
   upload,
@@ -1042,6 +1113,7 @@ module.exports = {
   avatarUpload,
   libraryImageUpload,
   collectionImageUpload,
+  communityPortalUpload,
   reviewBoardDocumentUpload,
   composerApplicationUpload,
   reviewBoardPhotoUpload,
@@ -1057,5 +1129,6 @@ module.exports = {
   generateFileName,
   BUCKET_NAME,
   BUCKET_REGION,
-  courseThumbnailUpload
+  courseThumbnailUpload,
+  deductionEntityLogoUpload
 };

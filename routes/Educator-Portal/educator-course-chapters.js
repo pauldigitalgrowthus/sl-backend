@@ -31,7 +31,7 @@ const verifyCourseOwnership = async (mysql, courseId, userId, userType, { requir
 
     const isAdmin = ["admin", "superadmin"].includes(userType);
     if (!isAdmin && course.educator_id !== userId) {
-        return { error: "Access denied – not your course", status: 403 };
+        return { error: "Access denied — not your course", status: 403 };
     }
 
     if (requireEditable && !isAdmin && NON_EDITABLE_STATUSES.includes(course.status)) {
@@ -134,7 +134,49 @@ router.get("/:courseId/chapters", auth, async (req, res) => {
 });
 
 /* ============================================================
-   3️⃣ UPDATE CHAPTER
+   3️⃣ REORDER CHAPTERS (MUST BE BEFORE :chapterId ROUTE!)
+   ------------------------------------------------------------
+   @route   PUT /api/educator/courses/:courseId/chapters/reorder
+   @desc    Reorder chapters by passing ordered array of chapter IDs
+   @access  Private (Educator)
+   @body    { order: [{ id: 1, chapter_order: 1 }, ...] }
+============================================================ */
+router.put("/:courseId/chapters/reorder", auth, async (req, res) => {
+    try {
+        const mysql = getMySQLConnection();
+        const { courseId } = req.params;
+        const { order } = req.body;
+
+        if (!Array.isArray(order) || order.length === 0) {
+            return errorResponse(res, "Order array is required", 400);
+        }
+
+        const { error, status } = await verifyCourseOwnership(
+            mysql, courseId, req.user.id, req.user.user_type, { requireEditable: true }
+        );
+        if (error) return errorResponse(res, error, status);
+
+        /* Update each chapter's order */
+        for (const item of order) {
+            if (!item.id || item.chapter_order === undefined) continue;
+
+            await mysql.execute(
+                `UPDATE course_chapters
+                 SET chapter_order = ?
+                 WHERE id = ? AND course_id = ?`,
+                [item.chapter_order, item.id, courseId]
+            );
+        }
+
+        return successResponse(res, null, "Chapters reordered successfully");
+    } catch (error) {
+        console.error("Reorder Chapters Error:", error);
+        return errorResponse(res, error.message, 500);
+    }
+});
+
+/* ============================================================
+   4️⃣ UPDATE CHAPTER
    ------------------------------------------------------------
    @route   PUT /api/educator/courses/:courseId/chapters/:chapterId
    @desc    Update chapter title, description, or preview flag
@@ -180,7 +222,7 @@ router.put("/:courseId/chapters/:chapterId", auth, async (req, res) => {
 });
 
 /* ============================================================
-   4️⃣ DELETE CHAPTER
+   5️⃣ DELETE CHAPTER
    ------------------------------------------------------------
    @route   DELETE /api/educator/courses/:courseId/chapters/:chapterId
    @desc    Soft-delete a chapter (deactivate)
@@ -232,48 +274,6 @@ router.delete("/:courseId/chapters/:chapterId", auth, async (req, res) => {
         return successResponse(res, null, "Chapter deleted successfully");
     } catch (error) {
         console.error("Delete Chapter Error:", error);
-        return errorResponse(res, error.message, 500);
-    }
-});
-
-/* ============================================================
-   5️⃣ REORDER CHAPTERS
-   ------------------------------------------------------------
-   @route   PUT /api/educator/courses/:courseId/chapters/reorder
-   @desc    Reorder chapters by passing ordered array of chapter IDs
-   @access  Private (Educator)
-   @body    { order: [{ id: 1, chapter_order: 1 }, ...] }
-============================================================ */
-router.put("/:courseId/chapters/reorder", auth, async (req, res) => {
-    try {
-        const mysql = getMySQLConnection();
-        const { courseId } = req.params;
-        const { order } = req.body;
-
-        if (!Array.isArray(order) || order.length === 0) {
-            return errorResponse(res, "Order array is required", 400);
-        }
-
-        const { error, status } = await verifyCourseOwnership(
-            mysql, courseId, req.user.id, req.user.user_type, { requireEditable: true }
-        );
-        if (error) return errorResponse(res, error, status);
-
-        /* Update each chapter's order */
-        for (const item of order) {
-            if (!item.id || item.chapter_order === undefined) continue;
-
-            await mysql.execute(
-                `UPDATE course_chapters
-                 SET chapter_order = ?
-                 WHERE id = ? AND course_id = ?`,
-                [item.chapter_order, item.id, courseId]
-            );
-        }
-
-        return successResponse(res, null, "Chapters reordered successfully");
-    } catch (error) {
-        console.error("Reorder Chapters Error:", error);
         return errorResponse(res, error.message, 500);
     }
 });

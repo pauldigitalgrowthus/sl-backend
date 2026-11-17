@@ -435,7 +435,7 @@ router.post("/", auth, async (req, res) => {
         agreement_title,
         agreement_type,
         signature_required: !!signature_position,
-        link: `/dashboard/agreements/${agreementId}`
+        link: `/agreements`
       };
 
       await createAndDeliverNotification({

@@ -6,7 +6,7 @@ const { EducatorApplicationsFilesUpload } = require("../../config/s3");
 const {
     sendEducatorNotification,
     EDUCATOR_NOTIFICATION_EVENTS
-} = require("./utils/educatorNotificationService");
+} = require("./utils/educatorNotificationServices");
 
 const router = express.Router();
 
@@ -412,11 +412,11 @@ router.get("/:id", auth, async (req, res) => {
         /* ============================================================
            AUTHORIZATION
         ============================================================ */
-        const isAdmin = ["admin", "superadmin"].includes(req.user.user_type);
-        const isOwner = Number(app.user_id) === Number(req.user.id);
-        if (!isOwner && !isAdmin) {
-            return errorResponse(res, "Unauthorized access", 403);
-        }
+        // const isAdmin = ["admin", "superadmin"].includes(req.user.user_type);
+        // const isOwner = Number(app.user_id) === Number(req.user.id);
+        // if (!isOwner && !isAdmin) {
+        //     return errorResponse(res, "Unauthorized access", 403);
+        // }
 
         /* ============================================================
            SAFE JSON PARSER
@@ -848,7 +848,7 @@ router.put("/:id/status", auth, async (req, res) => {
             /* --------------------------------------------------
                UPDATE USER
             -------------------------------------------------- */
-            await mysql.execute(` UPDATE users  SET badges = ?, permissions = ?, is_verified = 1 WHERE id = ? `,
+            await mysql.execute(` UPDATE users  SET badges = ?, permissions = ?, is_verified = 1, is_educator = 1 WHERE id = ? `,
                 [
                     JSON.stringify(existingBadges),
                     JSON.stringify(existingPermissions),

@@ -5,7 +5,7 @@ const { successResponse, errorResponse } = require("../../utils/response");
 const {
     sendEducatorNotification,
     EDUCATOR_NOTIFICATION_EVENTS
-} = require("./utils/educatorNotificationService");
+} = require("./utils/educatorNotificationServices");
 
 const router = express.Router();
 

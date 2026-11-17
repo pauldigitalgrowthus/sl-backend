@@ -5,6 +5,7 @@ const { successResponse, errorResponse } = require('../utils/response');
 const { stripe, createStripeCustomer } = require('../config/stripe');
 const { validateAndApplyCoupon, markCouponAsUsed, getSafeFileType } = require('../utils/couponUtils')
 const { sendEmail } = require("../utils/SendMailer");
+const { recordMusicALaCarteEarning } = require('../utils/royaltyEngine');
 
 const router = express.Router();
 
@@ -14,108 +15,6 @@ function parseJsonSafe(value, fallback) {
   if (typeof value !== 'string') return value;
   try { return JSON.parse(value); } catch (_) { return fallback; }
 }
-
-router.get("/check", async (req, res) => {
-  try {
-    const mysqlConnection = getMySQLConnection();
-
-    const [rows] = await mysqlConnection.execute(
-      "SELECT id, composition_title, music_files FROM music_publications WHERE status = 'published'"
-    );
-
-    let totalPdfFiles = 0;
-    let missingSampleThumbnail = 0;
-    let generatedSampleThumbnail = 0;
-    let invalidData = 0;
-
-    const publications = [];
-
-    for (const row of rows) {
-      if (!row.music_files) continue;
-
-      let musicFiles;
-
-      try {
-        musicFiles =
-          typeof row.music_files === "string"
-            ? JSON.parse(row.music_files)
-            : row.music_files;
-      } catch (err) {
-        invalidData++;
-        continue;
-      }
-
-      if (!Array.isArray(musicFiles)) continue;
-
-      const report = {
-        id: row.id,
-        compositionTitle: row.composition_title,
-        totalPdfFiles: 0,
-        generatedSampleThumbnails: 0,
-        missingSampleThumbnails: 0,
-        generatedFiles: [],
-        missingFiles: [],
-      };
-
-      for (const file of musicFiles) {
-        // Sirf PDF files check karo
-        if (file.fileType !== "application/pdf") continue;
-
-        totalPdfFiles++;
-        report.totalPdfFiles++;
-
-        const fileInfo = {
-          fileName: file.fileName,
-          pdfDesignation: file.pdfDesignation || "",
-        };
-
-        if (
-          file.sampleThumbnailUrl == null &&
-          file.sampleThumbnailGenerated === false
-        ) {
-          missingSampleThumbnail++;
-          report.missingSampleThumbnails++;
-          report.missingFiles.push(fileInfo);
-        } else if (
-          file.sampleThumbnailUrl &&
-          file.sampleThumbnailGenerated === true
-        ) {
-          generatedSampleThumbnail++;
-          report.generatedSampleThumbnails++;
-          report.generatedFiles.push(fileInfo);
-        }
-      }
-
-      // Sirf publications jisme PDF files hain
-      if (report.totalPdfFiles > 0) {
-        publications.push(report);
-      }
-    }
-
-    // Optional: Missing thumbnails wale publications pehle dikhao
-    publications.sort(
-      (a, b) => b.missingSampleThumbnails - a.missingSampleThumbnails
-    );
-
-    return successResponse(
-      res,
-      {
-        summary: {
-          totalPublications: rows.length,
-          totalPdfFiles,
-          generatedSampleThumbnail,
-          missingSampleThumbnail,
-          invalidData,
-        },
-        publications,
-      },
-      "Music files analysis completed."
-    );
-  } catch (error) {
-    console.error(error);
-    return errorResponse(res, "Something went wrong", 500);
-  }
-});
 
 router.get('/my-music', auth, async (req, res) => {
   try {
@@ -528,6 +427,22 @@ router.post('/purchase-file', auth, async (req, res) => {
         musicPublication.can_make_non_commercial_recording || false
       ]
     );
+
+    // /* ==========================================
+    //    🔥 ROYALTY HOOK INTEGRATION
+    // ========================================== */
+    // try {
+    //   await recordMusicALaCarteEarning({
+    //     mysql: mysqlConnection,
+    //     musicPublicationId: musicPublicationId,
+    //     buyerUserId: finalUserId,
+    //     salePrice: price,
+    //     stripeSessionId: null,
+    //     paymentMethod: 'subscription_direct'
+    //   });
+    // } catch (royaltyErr) {
+    //   console.warn("⚠️ Royalty log warning on purchase-file:", royaltyErr.message);
+    // }
 
     // Get the purchased file details
     const [purchasedFile] = await mysqlConnection.execute(`
@@ -2748,6 +2663,7 @@ router.post("/create-card-checkout-session", auth, async (req, res) => {
     const products = paidItems.map(i => ({
       musicPublicationId: i.music_publication_id,
       title: i.composition_title,
+      composer: `${i.composer_firstname || ""} ${i.composer_lastname || ""}`.trim(),
       price: parseFloat(i.price)
     }));
 
@@ -2867,8 +2783,8 @@ async function completeFreeOrder(req, res, cartItems) {
 
       for (const file of fileData) {
         await mysqlConnection.execute(`
-          INSERT INTO user_music_library (user_id, music_publication_id, file_type, file_name, file_url, file_size, price, purchase_date)
-          VALUES (?, ?, ?, ?, ?, ?, ?, NOW())
+          INSERT INTO user_music_library (user_id, music_publication_id, file_type, file_name, file_url, file_size, price, purchase_date, source_type)
+          VALUES (?, ?, ?, ?, ?, ?, ?, NOW(), 'a_la_carte')
         `, [
           userId,
           cartItem.music_publication_id,
@@ -3052,6 +2968,17 @@ router.post("/webhook", express.raw({ type: "application/json" }),
                 item.price
               ]
             );
+
+            // 🔥 ROYALTY ENGINE: deduct ICEL/USCCB/CCD, split 30% to composer
+            // Never blocks the purchase flow - errors are logged internally.
+            await recordMusicALaCarteEarning({
+              mysql,
+              musicPublicationId: musicId,
+              buyerUserId: userId,
+              salePrice: item.price,
+              stripeSessionId: session.id,
+              paymentMethod: 'stripe'
+            });
           }
 
           /* ================================
@@ -3364,10 +3291,6 @@ router.get('/orders/:orderId', auth, async (req, res) => {
 // @route   GET /api/user-music-library/payment-status/:sessionId
 // @desc    Finalize music order + files + coupon (IDEMPOTENT)
 // @access  Private
-// @route   GET /api/user-music-library/payment-status/:sessionId
-// @desc    Verify payment + add music to library
-// @access  Private
-
 router.get("/payment-status/:sessionId", auth, async (req, res) => {
 
   try {
@@ -3595,7 +3518,7 @@ router.get("/payment-status/:sessionId", auth, async (req, res) => {
           tune, general_details, country_restrictions,
           is_public_domain, can_be_reprinted, can_be_podcast_streamed,
           can_make_commercial_recording, can_make_non_commercial_recording,
-          purchase_date
+          purchase_date, source_type
         ) VALUES (
           ?, ?, ?, ?, ?, ?, ?,
           ?, ?, ?, ?,
@@ -3609,7 +3532,7 @@ router.get("/payment-status/:sessionId", auth, async (req, res) => {
           ?, ?, ?,
           ?, ?, ?,
           ?, ?,
-          NOW()
+          NOW(), 'a_la_carte'
         )`,
         [
           userId,
@@ -3665,6 +3588,23 @@ router.get("/payment-status/:sessionId", auth, async (req, res) => {
           music.can_make_non_commercial_recording || false
         ]
       );
+
+      /* ==========================================
+         🔥 ROYALTY HOOK INTEGRATION
+      ========================================== */
+      try {
+        await recordMusicALaCarteEarning({
+          mysql,
+          musicPublicationId: musicId,
+          buyerUserId: userId,
+          salePrice: item.price,
+          stripeSessionId: sessionId,
+          paymentMethod: 'stripe'
+        });
+      } catch (royaltyErr) {
+        console.warn("⚠️ Royalty log warning on payment-status:", royaltyErr.message);
+      }
+
       insertedLibraryItems.push({
         musicId,
         composition_title: music.composition_title,
@@ -4364,6 +4304,40 @@ router.get("/music-payments", auth, async (req, res) => {
       [limit, offset]
     );
 
+    // Gather all unique music publication IDs
+    const songIdsSet = new Set();
+    for (const tx of rows) {
+      let songs = [];
+      try {
+        songs = tx.products_json ? JSON.parse(tx.products_json) : [];
+      } catch (err) {
+        songs = [];
+      }
+      for (const s of songs) {
+        if (s.musicPublicationId) {
+          songIdsSet.add(s.musicPublicationId);
+        }
+      }
+    }
+
+    // Fetch composers & titles for these music publication IDs
+    const songMap = new Map();
+    if (songIdsSet.size > 0) {
+      const placeholders = Array(songIdsSet.size).fill("?").join(", ");
+      const [songRows] = await mysql.execute(
+        `SELECT id, composition_title, composer_firstname, composer_lastname 
+         FROM music_publications 
+         WHERE id IN (${placeholders})`,
+        Array.from(songIdsSet)
+      );
+      for (const s of songRows) {
+        songMap.set(s.id, {
+          title: s.composition_title,
+          composer: `${s.composer_firstname || ""} ${s.composer_lastname || ""}`.trim()
+        });
+      }
+    }
+
     const payments = [];
 
     for (const tx of rows) {
@@ -4385,8 +4359,8 @@ router.get("/music-payments", auth, async (req, res) => {
       ============================= */
       const musicList = songs.map(song => ({
         id: song.musicPublicationId,
-        title: song.title || null,
-        composer: song.composer || null,
+        title: songMap.get(song.musicPublicationId)?.title || song.title || null,
+        composer: songMap.get(song.musicPublicationId)?.composer || song.composer || null,
         price: song.price
       }));
 
@@ -4533,6 +4507,40 @@ router.get("/music-payments/export", async (req, res) => {
       console.log(rows[0]);
     }
 
+    // Gather all unique music publication IDs
+    const songIdsSet = new Set();
+    for (const tx of rows) {
+      let songs = [];
+      try {
+        songs = tx.products_json ? JSON.parse(tx.products_json) : [];
+      } catch (err) {
+        songs = [];
+      }
+      for (const s of songs) {
+        if (s.musicPublicationId) {
+          songIdsSet.add(s.musicPublicationId);
+        }
+      }
+    }
+
+    // Fetch composers & titles for these music publication IDs
+    const songMap = new Map();
+    if (songIdsSet.size > 0) {
+      const placeholders = Array(songIdsSet.size).fill("?").join(", ");
+      const [songRows] = await mysql.execute(
+        `SELECT id, composition_title, composer_firstname, composer_lastname 
+         FROM music_publications 
+         WHERE id IN (${placeholders})`,
+        Array.from(songIdsSet)
+      );
+      for (const s of songRows) {
+        songMap.set(s.id, {
+          title: s.composition_title,
+          composer: `${s.composer_firstname || ""} ${s.composer_lastname || ""}`.trim()
+        });
+      }
+    }
+
     const workbook = new ExcelJS.Workbook();
     const worksheet = workbook.addWorksheet("Music Payments");
     worksheet.columns = [
@@ -4568,15 +4576,20 @@ router.get("/music-payments/export", async (req, res) => {
         console.log("JSON Parse Error:", err);
         songs = [];
       }
+
+      const songIds = songs.map(x => x.musicPublicationId).join(", ");
+      const titles = songs.map(x => songMap.get(x.musicPublicationId)?.title || x.title || "").join(", ");
+      const composers = songs.map(x => songMap.get(x.musicPublicationId)?.composer || x.composer || "").join(", ");
+
       const row = worksheet.addRow({
         transactionId: tx.id,
         userId: tx.user_id,
         name: `${tx.first_name || ""} ${tx.last_name || ""}`.trim(),
         email: tx.email,
         phone: tx.phone,
-        songIds: songs.map(x => x.musicPublicationId).join(", "),
-        titles: songs.map(x => x.title).join(", "),
-        composers: songs.map(x => x.composer).join(", "),
+        songIds: songIds,
+        titles: titles,
+        composers: composers,
         amount: tx.total_amount,
         currency: tx.currency,
         status: tx.status,

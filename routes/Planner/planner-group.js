@@ -17,6 +17,11 @@ const { resolveCommunityId } = require('./helpers');
  */
 router.post('/', auth, async (req, res) => {
   try {
+    const userRole = (req.user?.role || req.user?.user_type || '').toLowerCase();
+    if (userRole === 'free_user') {
+      return errorResponse(res, 'Free users are not allowed to create groups. Please upgrade your account.', 403);
+    }
+
     const { group_name } = req.body;
 
     if (!group_name || !group_name.toString().trim()) {

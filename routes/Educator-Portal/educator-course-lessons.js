@@ -30,7 +30,7 @@ const verifyChapterAccess = async (mysql, courseId, chapterId, userId, userType,
 
     const isAdmin = ["admin", "superadmin"].includes(userType);
     if (!isAdmin && course.educator_id !== userId) {
-        return { error: "Access denied – not your course", status: 403 };
+        return { error: "Access denied - not your course", status: 403 };
     }
 
     if (requireEditable && !isAdmin && NON_EDITABLE_STATUSES.includes(course.status)) {
@@ -63,7 +63,7 @@ const parseJSON = (value, defaultValue = []) => {
 };
 
 /* ============================================================
-   1️⃣ CREATE LESSON
+   1. CREATE LESSON
    ------------------------------------------------------------
    @route   POST /api/educator/courses/:courseId/chapters/:chapterId/lessons
    @desc    Add a new lesson to a chapter
@@ -81,14 +81,25 @@ router.post("/:courseId/chapters/:chapterId/lessons", auth, CourseResourcesUploa
 
             const {
                 title,
+                lesson_title,
+                lessonTitle,
                 lesson_type,
                 content,
                 video_duration_minutes,
+                link_title,
+                linkTitle,
+                web_link_title,
+                link_url,
+                linkUrl,
+                web_link_url,
+                url,
+                file_url,
                 is_preview,
                 is_mandatory
             } = req.body;
 
-            if (!title) {
+            const finalTitle = title || lesson_title || lessonTitle;
+            if (!finalTitle) {
                 return errorResponse(res, "Lesson title is required", 400);
             }
 
@@ -114,7 +125,6 @@ router.post("/:courseId/chapters/:chapterId/lessons", auth, CourseResourcesUploa
             );
 
             // uploaded files
-
             const videoFile =
                 req.files?.video_url &&
                     req.files.video_url.length
@@ -129,14 +139,19 @@ router.post("/:courseId/chapters/:chapterId/lessons", auth, CourseResourcesUploa
 
             const resourceFiles = req.files?.resources || [];
 
-            // external link support
-
+            // external link & video URL
             let videoUrl = null;
-
             if (videoFile) {
                 videoUrl = videoFile.location;
             } else if (req.body.video_url) {
                 videoUrl = req.body.video_url;
+            }
+
+            const finalLinkUrl = link_url || linkUrl || web_link_url || url || file_url || (lesson_type === "external_link" ? videoUrl : null);
+            const finalLinkTitle = link_title || linkTitle || web_link_title || null;
+
+            if (!videoUrl && lesson_type === "external_link") {
+                videoUrl = finalLinkUrl;
             }
 
             let downloadableFiles = null;
@@ -151,7 +166,9 @@ router.post("/:courseId/chapters/:chapterId/lessons", auth, CourseResourcesUploa
                     }
                 ]);
             } else if (req.body.downloadable_files) {
-                downloadableFiles = req.body.downloadable_files;
+                downloadableFiles = typeof req.body.downloadable_files === "object"
+                    ? JSON.stringify(req.body.downloadable_files)
+                    : req.body.downloadable_files;
             }
 
             const [lessonResult] = await mysql.execute(
@@ -163,6 +180,8 @@ router.post("/:courseId/chapters/:chapterId/lessons", auth, CourseResourcesUploa
                     lesson_type,
                     content,
                     video_url,
+                    link_url,
+                    link_title,
                     video_duration_minutes,
                     downloadable_files,
                     lesson_order,
@@ -170,14 +189,16 @@ router.post("/:courseId/chapters/:chapterId/lessons", auth, CourseResourcesUploa
                     is_mandatory
                 )
                 VALUES
-                (?,?,?,?,?,?,?,?,?,?,?)`,
+                (?,?,?,?,?,?,?,?,?,?,?,?,?)`,
                 [
                     courseId,
                     chapterId,
-                    title,
+                    finalTitle,
                     lesson_type || "video",
                     content || null,
                     videoUrl,
+                    finalLinkUrl,
+                    finalLinkTitle,
                     video_duration_minutes || 0,
                     downloadableFiles,
                     maxOrder + 1,
@@ -189,13 +210,10 @@ router.post("/:courseId/chapters/:chapterId/lessons", auth, CourseResourcesUploa
             const lessonId = lessonResult.insertId;
 
             // save lesson resources
-
             const insertedResources = [];
 
             if (resourceFiles.length) {
-
                 for (const file of resourceFiles) {
-
                     const [resource] = await mysql.execute(
                         `INSERT INTO course_resources
                         (
@@ -241,6 +259,8 @@ router.post("/:courseId/chapters/:chapterId/lessons", auth, CourseResourcesUploa
                 res,
                 {
                     id: lessonId,
+                    link_url: finalLinkUrl,
+                    link_title: finalLinkTitle,
                     lesson_order: maxOrder + 1,
                     resources: insertedResources
                 },
@@ -255,7 +275,7 @@ router.post("/:courseId/chapters/:chapterId/lessons", auth, CourseResourcesUploa
     });
 
 /* ============================================================
-   2️⃣ GET LESSONS BY CHAPTER
+   2. GET LESSONS BY CHAPTER
    ------------------------------------------------------------
    @route   GET /api/educator/courses/:courseId/chapters/:chapterId/lessons
    @desc    Fetch all lessons within a chapter
@@ -318,11 +338,17 @@ router.get("/:courseId/chapters/:chapterId/lessons", auth, async (req, res) => {
             resourcesMap[resource.lesson_id].push(resource);
         });
 
-        const formatted = lessons.map((lesson) => ({
-            ...lesson,
-            downloadable_files: parseJSON(lesson.downloadable_files),
-            resources: resourcesMap[lesson.id] || []
-        }));
+        const formatted = lessons.map((lesson) => {
+            const rawType = (lesson.lesson_type || "").toLowerCase();
+            const linkUrlFallback = lesson.link_url || (rawType === "external_link" ? lesson.video_url : null);
+
+            return {
+                ...lesson,
+                link_url: linkUrlFallback,
+                downloadable_files: parseJSON(lesson.downloadable_files),
+                resources: resourcesMap[lesson.id] || []
+            };
+        });
 
         return successResponse(res, formatted, "Lessons fetched successfully");
     } catch (error) {
@@ -332,7 +358,48 @@ router.get("/:courseId/chapters/:chapterId/lessons", auth, async (req, res) => {
 });
 
 /* ============================================================
-   3️⃣ UPDATE LESSON
+   3. REORDER LESSONS (MUST BE BEFORE :lessonId ROUTE!)
+   ------------------------------------------------------------
+   @route   PUT /api/educator/courses/:courseId/chapters/:chapterId/lessons/reorder
+   @desc    Reorder lessons within a chapter
+   @access  Private (Educator)
+   @body    { order: [{ id: 1, lesson_order: 1 }, ...] }
+============================================================ */
+router.put("/:courseId/chapters/:chapterId/lessons/reorder", auth, async (req, res) => {
+    try {
+        const mysql = getMySQLConnection();
+        const { courseId, chapterId } = req.params;
+        const { order } = req.body;
+
+        if (!Array.isArray(order) || order.length === 0) {
+            return errorResponse(res, "Order array is required", 400);
+        }
+
+        const { error, status } = await verifyChapterAccess(
+            mysql, courseId, chapterId, req.user.id, req.user.user_type, { requireEditable: true }
+        );
+        if (error) return errorResponse(res, error, status);
+
+        for (const item of order) {
+            if (!item.id || item.lesson_order === undefined) continue;
+
+            await mysql.execute(
+                `UPDATE course_lessons
+                 SET lesson_order = ?
+                 WHERE id = ? AND chapter_id = ? AND course_id = ?`,
+                [item.lesson_order, item.id, chapterId, courseId]
+            );
+        }
+
+        return successResponse(res, null, "Lessons reordered successfully");
+    } catch (error) {
+        console.error("Reorder Lessons Error:", error);
+        return errorResponse(res, error.message, 500);
+    }
+});
+
+/* ============================================================
+   4. UPDATE LESSON
    ------------------------------------------------------------
    @route   PUT /api/educator/courses/:courseId/chapters/:chapterId/lessons/:lessonId
    @desc    Update lesson content, type, or metadata
@@ -345,9 +412,19 @@ router.put("/:courseId/chapters/:chapterId/lessons/:lessonId", auth, async (req,
 
         const {
             title,
+            lesson_title,
+            lessonTitle,
             lesson_type,
             content,
             video_url,
+            link_url,
+            linkUrl,
+            web_link_url,
+            url,
+            file_url,
+            link_title,
+            linkTitle,
+            web_link_title,
             video_duration_minutes,
             downloadable_files,
             lesson_order,
@@ -368,9 +445,18 @@ router.put("/:courseId/chapters/:chapterId/lessons/:lessonId", auth, async (req,
 
         if (!lesson) return errorResponse(res, "Lesson not found", 404);
 
-        const VALID_TYPES = ["video", "text", "pdf", "audio", "quiz", "assignment"];
+        const VALID_TYPES = ["video", "text", "pdf", "audio", "quiz", "assignment", "external_link"];
         if (lesson_type && !VALID_TYPES.includes(lesson_type)) {
             return errorResponse(res, `Invalid lesson type. Must be one of: ${VALID_TYPES.join(", ")}`, 400);
+        }
+
+        const finalTitle = title || lesson_title || lessonTitle || lesson.title;
+        const finalLinkUrl = link_url !== undefined ? link_url : (linkUrl || web_link_url || url || file_url || lesson.link_url || null);
+        const finalLinkTitle = link_title !== undefined ? link_title : (linkTitle || web_link_title || lesson.link_title || null);
+        let finalVideoUrl = video_url !== undefined ? video_url : lesson.video_url;
+
+        if (!finalVideoUrl && (lesson_type === "external_link" || (!lesson_type && lesson.lesson_type === "external_link"))) {
+            finalVideoUrl = finalLinkUrl;
         }
 
         await mysql.execute(
@@ -379,6 +465,8 @@ router.put("/:courseId/chapters/:chapterId/lessons/:lessonId", auth, async (req,
                 lesson_type             = ?,
                 content                 = ?,
                 video_url               = ?,
+                link_url                = ?,
+                link_title              = ?,
                 video_duration_minutes  = ?,
                 downloadable_files      = ?,
                 lesson_order            = ?,
@@ -386,20 +474,33 @@ router.put("/:courseId/chapters/:chapterId/lessons/:lessonId", auth, async (req,
                 is_mandatory            = ?
              WHERE id = ?`,
             [
-                title ?? lesson.title,
+                finalTitle,
                 lesson_type || lesson.lesson_type,
-                content ?? lesson.content,
-                video_url ?? lesson.video_url,
-                video_duration_minutes ?? lesson.video_duration_minutes,
-                downloadable_files ? JSON.stringify(downloadable_files) : lesson.downloadable_files,
-                lesson_order ?? lesson.lesson_order,
+                content !== undefined ? content : lesson.content,
+                finalVideoUrl,
+                finalLinkUrl,
+                finalLinkTitle,
+                video_duration_minutes !== undefined ? video_duration_minutes : lesson.video_duration_minutes,
+                downloadable_files ? (typeof downloadable_files === "object" ? JSON.stringify(downloadable_files) : downloadable_files) : lesson.downloadable_files,
+                lesson_order !== undefined ? lesson_order : lesson.lesson_order,
                 is_preview !== undefined ? (is_preview ? 1 : 0) : lesson.is_preview,
                 is_mandatory !== undefined ? (is_mandatory ? 1 : 0) : lesson.is_mandatory,
                 lessonId
             ]
         );
+        const [[updatedLesson]] = await mysql.execute(
+            `SELECT * FROM course_lessons WHERE id = ? LIMIT 1`,
+            [lessonId]
+        );
 
-        return successResponse(res, null, "Lesson updated successfully");
+        const rawType = (updatedLesson.lesson_type || "").toLowerCase();
+        const responseData = {
+            ...updatedLesson,
+            link_url: updatedLesson.link_url || (rawType === "external_link" ? updatedLesson.video_url : null),
+            downloadable_files: parseJSON(updatedLesson.downloadable_files)
+        };
+
+        return successResponse(res, responseData, "Lesson updated successfully");
     } catch (error) {
         console.error("Update Lesson Error:", error);
         return errorResponse(res, error.message, 500);
@@ -407,7 +508,7 @@ router.put("/:courseId/chapters/:chapterId/lessons/:lessonId", auth, async (req,
 });
 
 /* ============================================================
-   4️⃣ DELETE LESSON
+   5. DELETE LESSON
    ------------------------------------------------------------
    @route   DELETE /api/educator/courses/:courseId/chapters/:chapterId/lessons/:lessonId
    @desc    Soft-delete a lesson (deactivate)

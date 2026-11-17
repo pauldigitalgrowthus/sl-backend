@@ -1,0 +1,1354 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>SL Community — Test Console</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Fraunces:opsz,wght@9..144,600&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<!-- <script src="https://cdn.socket.io/4.8.1/socket.io.min.js"></script> -->
+<script src="http://localhost:5000/socket.io/socket.io.js"></script>
+<style>
+  :root{
+    --rail-bg:#0c1e33;
+    --nav-bg:#123256;
+    --nav-bg-2:#153a63;
+    --nav-text:#93a8c7;
+    --accent:#2f6fed;
+    --accent-dark:#2456bf;
+    --bg:#f2f4f8;
+    --panel:#ffffff;
+    --border:#e7ebf1;
+    --text:#16304f;
+    --muted:#7686a0;
+    --online:#33cc7a;
+    --away:#f2a93b;
+    --danger:#e0524c;
+    --danger-bg:#fdeceb;
+    --success-bg:#e8f7ee;
+  }
+  *{box-sizing:border-box;}
+  html,body{height:100%;margin:0;}
+  body{font-family:'Inter',sans-serif;background:var(--bg);color:var(--text);-webkit-font-smoothing:antialiased;}
+  .brand{font-family:'Fraunces',serif;font-weight:600;}
+  button{font-family:inherit;cursor:pointer;border:none;background:none;}
+  input,textarea,select{font-family:inherit;}
+  a{color:inherit;text-decoration:none;}
+
+  #app{display:flex;height:100vh;overflow:hidden;}
+
+  .rail{width:58px;flex-shrink:0;background:var(--rail-bg);display:flex;flex-direction:column;align-items:center;padding:16px 0;gap:6px;}
+  .rail .mark{width:34px;height:34px;border-radius:9px;background:var(--accent);display:flex;align-items:center;justify-content:center;color:#fff;font-size:15px;font-weight:800;margin-bottom:18px;}
+  .rail-ic{width:38px;height:38px;border-radius:10px;display:flex;align-items:center;justify-content:center;color:#5d7396;font-size:16px;}
+  .rail-ic.active{background:var(--accent);color:#fff;}
+  .rail .grow{flex:1;}
+  .rail-avatar{width:34px;height:34px;border-radius:50%;background:linear-gradient(135deg,#4d7bd9,#2f6fed);color:#fff;font-size:11px;font-weight:700;display:flex;align-items:center;justify-content:center;}
+
+  .navcol{width:196px;flex-shrink:0;background:var(--nav-bg);display:flex;flex-direction:column;padding:18px 12px;overflow-y:auto;}
+  .nav-hd{font-size:10.5px;font-weight:700;letter-spacing:.6px;color:#5d7396;text-transform:uppercase;padding:10px 8px 6px;}
+  .nav-item{display:flex;align-items:center;gap:10px;padding:9px 10px;border-radius:8px;font-size:13px;font-weight:500;color:var(--nav-text);margin-bottom:2px;}
+  .nav-item .ic{width:16px;text-align:center;font-size:13px;}
+  .nav-item:hover{background:rgba(255,255,255,.06);color:#fff;}
+  .nav-item.active{background:var(--accent);color:#fff;}
+  .nav-divider{height:1px;background:rgba(255,255,255,.08);margin:12px 4px;}
+  .navcol .grow{flex:1;}
+  .conn-pill{display:flex;align-items:center;gap:7px;font-size:11px;color:#8fa4c4;background:rgba(255,255,255,.05);padding:8px 10px;border-radius:9px;margin-top:8px;}
+  .conn-dot{width:7px;height:7px;border-radius:50%;background:#5a6f8f;}
+  .conn-dot.on{background:var(--online);box-shadow:0 0 0 3px rgba(51,204,122,.25);}
+  .conn-dot.off{background:var(--danger);}
+
+  .main{flex:1;display:flex;flex-direction:column;min-width:0;}
+  .topbar{height:62px;flex-shrink:0;background:var(--panel);border-bottom:1px solid var(--border);display:flex;align-items:center;padding:0 22px;gap:14px;}
+  .topbar h1{font-size:17px;margin:0;font-weight:700;flex:1;}
+  .topbar .sub{display:block;font-size:11.5px;color:var(--muted);font-weight:400;margin-top:1px;}
+  .icon-btn{width:34px;height:34px;border-radius:9px;background:#f2f5fa;color:#5d6e88;display:flex;align-items:center;justify-content:center;font-size:14px;position:relative;}
+  .icon-btn:hover{background:#e7ecf5;}
+  .settings-pop{position:absolute;top:56px;right:22px;background:#fff;border:1px solid var(--border);border-radius:12px;box-shadow:0 14px 34px rgba(15,32,54,.18);padding:14px;width:260px;display:none;z-index:60;}
+  .settings-pop.open{display:block;}
+  .user-chip{display:flex;align-items:center;gap:8px;font-size:12.5px;font-weight:700;background:#f2f5fa;padding:4px 10px 4px 4px;border-radius:20px;}
+
+  .content{flex:1;overflow-y:auto;padding:20px 22px;}
+  .view{display:none;}
+  .view.active{display:block;}
+
+  .toolbar{display:flex;justify-content:space-between;align-items:center;margin-bottom:14px;gap:10px;flex-wrap:wrap;}
+  .toolbar .filters{display:flex;gap:8px;flex-wrap:wrap;}
+  .toolbar select{padding:7px 9px;border:1px solid var(--border);border-radius:8px;font-size:12.5px;background:#fff;}
+  .btn{border:none;border-radius:9px;padding:9px 16px;font-size:13px;font-weight:700;background:var(--accent);color:#fff;}
+  .btn:hover{background:var(--accent-dark);}
+  .btn.ghost{background:#fff;color:var(--accent);border:1px solid #cfe0fb;}
+  .btn.ghost:hover{background:#eef4ff;}
+  .btn.danger{background:var(--danger);}
+  .btn.sm{padding:6px 12px;font-size:12px;border-radius:7px;}
+  .btn:disabled{opacity:.5;cursor:not-allowed;}
+
+  .pill-tabs{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap;}
+  .pill-tab{padding:6px 13px;border-radius:20px;font-size:12px;font-weight:700;background:#fff;border:1px solid var(--border);color:var(--muted);}
+  .pill-tab.active{background:var(--nav-bg);color:#fff;border-color:var(--nav-bg);}
+
+  .field{margin-bottom:10px;}
+  .field label{display:block;font-size:11.5px;font-weight:700;color:var(--muted);margin-bottom:4px;}
+  .field input,.field textarea,.field select{width:100%;padding:9px 10px;border:1px solid var(--border);border-radius:8px;font-size:13px;background:#fbfcfe;}
+  .field textarea{resize:vertical;min-height:60px;}
+  .field-row{display:flex;gap:10px;}
+  .field-row .field{flex:1;}
+
+  .card{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:15px 16px;margin-bottom:12px;}
+  .post-head{display:flex;align-items:center;gap:10px;margin-bottom:9px;}
+  .avatar{width:38px;height:38px;border-radius:50%;background:linear-gradient(135deg,#4d7bd9,#2f6fed);color:#fff;display:flex;align-items:center;justify-content:center;font-size:12.5px;font-weight:700;flex-shrink:0;position:relative;}
+  .avatar.sm{width:24px;height:24px;font-size:9.5px;}
+  .status-dot{position:absolute;bottom:-1px;right:-1px;width:9px;height:9px;border-radius:50%;border:2px solid #fff;}
+  .status-dot.online{background:var(--online);}
+  .status-dot.away{background:var(--away);}
+  .name-row{flex:1;min-width:0;display:flex;align-items:center;gap:8px;}
+  .name-row .name{font-size:13.5px;font-weight:700;}
+  .name-row .time{font-size:11px;color:var(--muted);margin-left:auto;white-space:nowrap;}
+  .badge{font-size:10px;font-weight:700;padding:2px 8px;border-radius:20px;background:#eef3ff;color:var(--accent);text-transform:uppercase;letter-spacing:.3px;}
+  .badge.pinned{background:#fbf1de;color:#c98a1f;}
+  .badge.locked{background:var(--danger-bg);color:var(--danger);}
+  .badge.public{background:var(--success-bg);color:#2fae5c;}
+  .badge.private{background:#f1eefb;color:#7b5ce0;}
+  .post-body{font-size:13.5px;line-height:1.6;color:#31445f;white-space:pre-wrap;margin-bottom:2px;}
+  .post-img{max-width:100%;border-radius:11px;margin-top:9px;display:block;}
+  .link-chip{display:flex;align-items:center;gap:8px;margin-top:9px;padding:9px 11px;background:#f5f8ff;border:1px solid #dbe6fd;border-radius:9px;font-size:12.5px;}
+  .link-chip a{color:var(--accent);font-weight:600;}
+  .link-chip .lbl{font-weight:700;color:var(--accent);}
+  .footer-row{display:flex;align-items:center;gap:18px;margin-top:11px;padding-top:10px;border-top:1px solid var(--border);}
+  .mini-action{display:flex;align-items:center;gap:6px;font-size:12px;color:var(--muted);font-weight:600;cursor:pointer;}
+  .mini-action:hover{color:var(--accent);}
+  .mini-action.liked{color:var(--accent);}
+  .footer-row .spacer{flex:1;}
+
+  .comments{margin-top:10px;padding-top:10px;border-top:1px dashed var(--border);display:none;}
+  .comments.open{display:block;}
+  .comment{display:flex;gap:8px;margin-bottom:8px;font-size:12.5px;}
+  .comment .bubble{background:#f2f5fa;border-radius:10px;padding:7px 10px;flex:1;}
+  .comment .cname{font-weight:700;margin-right:4px;}
+  .reply-row{display:flex;align-items:center;gap:8px;margin-top:9px;background:#f6f8fb;border-radius:24px;padding:5px 6px 5px 14px;}
+  .reply-row input{flex:1;border:none;background:transparent;font-size:12.5px;padding:6px 0;outline:none;}
+  .send-btn{width:30px;height:30px;border-radius:50%;background:var(--accent);color:#fff;display:flex;align-items:center;justify-content:center;font-size:13px;flex-shrink:0;cursor:pointer;}
+  .send-btn:hover{background:var(--accent-dark);}
+
+  .empty{text-align:center;padding:46px 20px;color:var(--muted);font-size:13px;background:var(--panel);border:1px dashed var(--border);border-radius:14px;}
+  .empty .big{font-size:26px;margin-bottom:8px;}
+
+  .grid{display:grid;grid-template-columns:repeat(auto-fill,minmax(250px,1fr));gap:14px;}
+  .group-cover{height:64px;border-radius:9px;background:linear-gradient(135deg,#123256,#2f6fed);margin-bottom:10px;}
+  .group-item h4{margin:0 0 4px 0;font-size:14px;}
+  .group-item .desc{font-size:12px;color:var(--muted);margin-bottom:8px;min-height:30px;}
+  .group-item .stats{font-size:11.5px;color:var(--muted);margin-bottom:10px;}
+
+  .with-profile{display:flex;gap:18px;align-items:flex-start;}
+  .with-profile .col-main{flex:1;min-width:0;}
+
+  .profile-panel{width:250px;flex-shrink:0;display:flex;flex-direction:column;gap:14px;}
+  .profile-card{background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;}
+  .cover{height:64px;background:linear-gradient(120deg,#bcd6f5,#dfeaf9);}
+  .profile-body{padding:0 14px 14px;text-align:center;margin-top:-26px;}
+  .profile-avatar{width:56px;height:56px;border-radius:50%;border:3px solid #fff;margin:0 auto 8px;background:linear-gradient(135deg,#4d7bd9,#2f6fed);color:#fff;font-size:17px;font-weight:700;display:flex;align-items:center;justify-content:center;}
+  .profile-body .pname{font-size:14px;font-weight:700;}
+  .profile-body .prole{font-size:11px;color:var(--muted);margin-bottom:8px;text-transform:capitalize;}
+  .profile-body .btn{width:100%;}
+  .panel-block{background:var(--panel);border:1px solid var(--border);border-radius:14px;padding:14px;}
+  .panel-block h4{margin:0 0 10px 0;font-size:12.5px;font-weight:700;display:flex;justify-content:space-between;align-items:center;}
+  .panel-block h4 .see-all{font-size:10.5px;color:var(--accent);font-weight:700;cursor:pointer;}
+  .quick-row{display:flex;align-items:center;gap:9px;padding:7px 4px;border-radius:8px;font-size:12px;cursor:pointer;}
+  .quick-row:hover{background:#f5f8fc;}
+  .quick-row .qname{flex:1;font-weight:600;color:#31445f;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .quick-row .qcnt{font-size:10.5px;color:var(--muted);}
+  .empty-mini{font-size:11.5px;color:var(--muted);padding:6px 4px;}
+
+  .msg-layout{display:flex;gap:0;height:calc(100vh - 168px);background:var(--panel);border:1px solid var(--border);border-radius:14px;overflow:hidden;}
+  .conv-list{width:280px;flex-shrink:0;border-right:1px solid var(--border);overflow-y:auto;}
+  .conv-list-head{padding:14px 16px;border-bottom:1px solid var(--border);font-weight:700;font-size:13.5px;}
+  .conv-item{padding:12px 14px;border-bottom:1px solid #f1f3f8;cursor:pointer;display:flex;gap:10px;align-items:center;}
+  .conv-item:hover{background:#f7f9fc;}
+  .conv-item.active{background:#eef3ff;}
+  .conv-item .meta{flex:1;min-width:0;}
+  .conv-item .cname{font-size:13px;font-weight:700;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .conv-item .last{font-size:11.5px;color:var(--muted);white-space:nowrap;overflow:hidden;text-overflow:ellipsis;}
+  .conv-item .unread{background:var(--accent);color:#fff;font-size:10px;font-weight:700;border-radius:10px;padding:1px 7px;}
+  .chat-panel{flex:1;display:flex;flex-direction:column;min-width:0;}
+  .chat-head{padding:13px 18px;border-bottom:1px solid var(--border);font-weight:700;font-size:13.5px;display:flex;align-items:center;gap:10px;}
+  .chat-body{flex:1;overflow-y:auto;padding:18px;display:flex;flex-direction:column;gap:10px;background:#f7f9fc;}
+  .msg-bubble{max-width:62%;padding:9px 13px;border-radius:14px;font-size:13px;line-height:1.45;}
+  .msg-bubble.me{align-self:flex-end;background:var(--accent);color:#fff;border-bottom-right-radius:4px;}
+  .msg-bubble.them{align-self:flex-start;background:#fff;border:1px solid var(--border);color:var(--text);border-bottom-left-radius:4px;}
+  .msg-bubble .t{font-size:10px;opacity:.7;margin-top:3px;}
+  .chat-input{display:flex;gap:9px;padding:13px 16px;border-top:1px solid var(--border);}
+  .chat-input input{flex:1;border:1px solid var(--border);border-radius:22px;padding:10px 16px;font-size:13px;background:#fbfcfe;}
+
+  .toast-wrap{position:fixed;bottom:20px;right:20px;z-index:999;display:flex;flex-direction:column;gap:8px;}
+  .toast{background:var(--nav-bg);color:#fff;padding:11px 16px;border-radius:9px;font-size:12.5px;box-shadow:0 8px 24px rgba(0,0,0,.25);min-width:220px;animation:slidein .18s ease;}
+  .toast.err{background:var(--danger);}
+  .toast.ok{background:#2fae5c;}
+  .toast.live{background:var(--nav-bg-2);border-left:3px solid var(--accent);}
+  @keyframes slidein{from{transform:translateY(8px);opacity:0;}to{transform:translateY(0);opacity:1;}}
+
+  .modal-overlay{position:fixed;inset:0;background:rgba(12,30,51,.5);display:none;align-items:center;justify-content:center;z-index:500;backdrop-filter:blur(2px);}
+  .modal-overlay.open{display:flex;}
+  .modal{background:#fff;border-radius:16px;width:460px;max-width:92vw;box-shadow:0 24px 60px rgba(12,30,51,.3);overflow:hidden;}
+  .modal-head{display:flex;align-items:center;padding:16px 18px;border-bottom:1px solid var(--border);}
+  .modal-head h3{margin:0;font-size:15px;flex:1;}
+  .modal-close{width:28px;height:28px;border-radius:50%;background:#f2f5fa;color:#5d6e88;display:flex;align-items:center;justify-content:center;font-size:14px;cursor:pointer;}
+  .modal-close:hover{background:#e7ecf5;}
+  .modal-body{padding:16px 18px;max-height:70vh;overflow-y:auto;}
+  .modal-body textarea{width:100%;border:none;font-size:14px;min-height:100px;resize:vertical;outline:none;background:transparent;}
+  .modal-user{display:flex;align-items:center;gap:9px;margin-bottom:10px;}
+  .modal-user .name{font-size:13.5px;font-weight:700;}
+  .modal-foot{display:flex;align-items:center;justify-content:space-between;padding:12px 18px;border-top:1px solid var(--border);gap:10px;}
+  .attach-row{display:flex;gap:8px;align-items:center;}
+  .attach-btn{width:34px;height:34px;border-radius:9px;background:#f2f5fa;color:#5d6e88;display:flex;align-items:center;justify-content:center;font-size:14px;cursor:pointer;}
+  .attach-btn:hover{background:#e7ecf5;}
+  #feedImages{display:none;}
+
+  .lock-overlay{position:fixed;inset:0;background:rgba(12,30,51,.55);display:flex;align-items:center;justify-content:center;z-index:600;backdrop-filter:blur(2px);}
+  .login-card{background:#fff;border-radius:16px;padding:30px 34px;width:340px;box-shadow:0 20px 60px rgba(12,30,51,.3);}
+  .login-card .logo{display:flex;align-items:center;justify-content:center;gap:8px;color:#16304f;font-size:19px;margin-bottom:4px;}
+  .login-card .sub{text-align:center;color:var(--muted);font-size:12.5px;margin-bottom:20px;}
+  .login-card .btn{width:100%;padding:10px;font-size:13.5px;margin-top:4px;}
+  .switch-user{font-size:11.5px;text-align:center;margin-top:12px;color:var(--muted);}
+  .switch-user button{color:var(--accent);font-weight:700;font-size:11.5px;cursor:pointer;}
+
+  .hint{font-size:11.5px;color:var(--muted);margin-top:2px;}
+  .divider{height:1px;background:var(--border);margin:14px 0;}
+  ::-webkit-scrollbar{width:8px;height:8px;}
+  ::-webkit-scrollbar-thumb{background:#c7d0dd;border-radius:8px;}
+</style>
+</head>
+<body>
+
+<div id="app">
+
+  <div class="rail">
+    <div class="mark">SL</div>
+    <div class="rail-ic active" id="railFeed" title="Feed">&#9776;</div>
+    <div class="rail-ic" id="railDisc" title="Discussions">&#128172;</div>
+    <div class="rail-ic" id="railGroups" title="Groups">&#128101;</div>
+    <div class="rail-ic" id="railChat" title="Messages">&#9993;</div>
+    <div class="rail-ic" id="railPrayer" title="Prayer Intentions">&#128591;</div>
+    <div class="grow"></div>
+    <div class="rail-avatar" id="railAvatar">?</div>
+  </div>
+
+  <div class="navcol">
+    <div class="nav-hd">My Community</div>
+    <div class="nav-item active" data-view="feed"><span class="ic">&#9776;</span> Feed</div>
+    <div class="nav-item" data-view="discussions"><span class="ic">&#128172;</span> Discussion</div>
+    <div class="nav-item" data-view="groups"><span class="ic">&#128101;</span> Groups</div>
+    <div class="nav-item" data-view="messages"><span class="ic">&#9993;</span> Chat</div>
+    <div class="nav-item" data-view="prayer"><span class="ic">&#128591;</span> Prayers</div>
+
+    <div class="nav-divider"></div>
+    <div class="nav-hd">Resources</div>
+    <div class="nav-item" data-view="channels"><span class="ic">&#35;</span> Channels</div>
+    <div class="nav-item" data-view="moderation"><span class="ic">&#128737;</span> Moderation</div>
+
+    <div class="grow"></div>
+    <div class="conn-pill"><span class="conn-dot off" id="socketDot"></span><span id="socketLabel">Socket disconnected</span></div>
+  </div>
+
+  <div class="main">
+    <div class="topbar">
+      <h1 id="viewTitle">Feed<span class="sub" id="viewSub">Public posts &amp; product links</span></h1>
+      <div class="icon-btn" onclick="App.toggleSettings()" title="Connection settings">&#9881;
+        <div class="settings-pop" id="settingsPop">
+          <div class="field"><label>API base URL</label><input id="apiBase" value="http://localhost:5000/api"></div>
+          <div class="field"><label>Socket URL</label><input id="socketBase" value="http://localhost:5000"></div>
+          <button class="btn sm" style="width:100%;" onclick="App.reconnect()">Apply &amp; reconnect</button>
+        </div>
+      </div>
+      <div id="userArea"></div>
+    </div>
+
+    <div class="content">
+
+      <div class="view active" id="view-feed">
+        <div class="with-profile">
+          <div class="col-main">
+            <div class="toolbar">
+              <div class="filters">
+                <select id="feedChannelFilter" onchange="Feed.load()"><option value="">All channels</option></select>
+                <select id="feedGroupFilter" onchange="Feed.load()"><option value="">All groups</option></select>
+              </div>
+              <button class="btn" onclick="Feed.openComposer()">+ Create Post</button>
+            </div>
+            <div id="feedList"></div>
+          </div>
+          <div class="profile-panel" id="profilePanel"></div>
+        </div>
+      </div>
+
+      <div class="view" id="view-discussions">
+        <div class="with-profile">
+          <div class="col-main">
+            <div class="toolbar">
+              <div class="pill-tabs" id="discSortTabs">
+                <div class="pill-tab active" data-sort="latest">Latest</div>
+                <div class="pill-tab" data-sort="popular">Popular</div>
+                <div class="pill-tab" data-sort="unanswered">Unanswered</div>
+              </div>
+              <button class="btn" onclick="Discussions.openComposer()">+ New Thread</button>
+            </div>
+            <div id="discList"></div>
+            <div id="discThreadDetail"></div>
+          </div>
+          <div class="profile-panel" id="profilePanel2"></div>
+        </div>
+      </div>
+
+      <div class="view" id="view-groups">
+        <div class="toolbar">
+          <div class="pill-tabs" id="groupTypeTabs">
+            <div class="pill-tab active" data-type="">All</div>
+            <div class="pill-tab" data-type="diocesan">Diocesan</div>
+            <div class="pill-tab" data-type="parish">Parish</div>
+            <div class="pill-tab" data-type="composer">Composer</div>
+            <div class="pill-tab" data-type="interest">Interest</div>
+          </div>
+          <button class="btn" onclick="Groups.openComposer()">+ Create Group</button>
+        </div>
+        <div class="grid" id="groupGrid"></div>
+        <div id="groupDetail"></div>
+      </div>
+
+      <div class="view" id="view-messages">
+        <div class="toolbar">
+          <div></div>
+          <button class="btn" onclick="Messaging.openComposer()">+ Start Conversation</button>
+        </div>
+        <div class="msg-layout">
+          <div class="conv-list">
+            <div class="conv-list-head">Group &amp; Private Messages</div>
+            <div id="convList"></div>
+          </div>
+          <div class="chat-panel">
+            <div class="chat-head" id="chatHead">Select a conversation</div>
+            <div class="chat-body" id="chatBody"></div>
+            <div class="chat-input">
+              <input id="chatInput" placeholder="Type a message..." onkeydown="if(event.key==='Enter')Messaging.send()">
+              <div class="send-btn" onclick="Messaging.send()">&#10148;</div>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <div class="view" id="view-channels">
+        <div class="toolbar">
+          <div></div>
+          <button class="btn" onclick="Channels.openComposer()">+ Create Channel (Admin)</button>
+        </div>
+        <div class="grid" id="channelGrid"></div>
+      </div>
+
+      <div class="view" id="view-prayer">
+        <div class="toolbar">
+          <div class="pill-tabs" id="prayerStatusTabs">
+            <div class="pill-tab active" data-status="">All</div>
+            <div class="pill-tab" data-status="ongoing">Ongoing</div>
+            <div class="pill-tab" data-status="answered">Answered</div>
+          </div>
+          <button class="btn" onclick="Prayer.openComposer()">+ Post Request</button>
+        </div>
+        <div id="prayerList"></div>
+      </div>
+
+      <div class="view" id="view-moderation">
+        <div class="card">
+          <h3 style="margin:0 0 10px;font-size:14px;">Report content</h3>
+          <div class="field-row">
+            <div class="field"><label>Content type</label>
+              <select id="repType"><option value="post">Post</option><option value="comment">Comment</option><option value="thread">Thread</option><option value="reply">Reply</option><option value="prayer">Prayer</option><option value="group">Group</option><option value="message">Message</option></select>
+            </div>
+            <div class="field"><label>Content ID</label><input id="repId" placeholder="e.g. 12"></div>
+          </div>
+          <div class="field"><label>Reason</label><input id="repReason" placeholder="e.g. Inappropriate content"></div>
+          <div style="display:flex; justify-content:flex-end;"><button class="btn sm" onclick="Moderation.report()">Submit report</button></div>
+        </div>
+
+        <div class="card">
+          <h3 style="margin:0 0 10px;font-size:14px;">Quick moderation actions <span class="hint">(Admin / SL Team only)</span></h3>
+          <div class="field-row">
+            <div class="field"><label>Content type</label>
+              <select id="modType"><option value="post">Post</option><option value="thread">Thread</option><option value="comment">Comment</option><option value="prayer">Prayer</option><option value="group">Group</option></select>
+            </div>
+            <div class="field"><label>Content ID</label><input id="modId"></div>
+          </div>
+          <div style="display:flex; gap:8px;">
+            <button class="btn ghost sm" onclick="Moderation.action('hide')">Hide</button>
+            <button class="btn ghost sm" onclick="Moderation.action('restore')">Restore</button>
+            <button class="btn danger sm" onclick="Moderation.action('remove')">Remove permanently</button>
+          </div>
+        </div>
+
+        <div class="toolbar"><h3 style="margin:0;font-size:14px;">Pending reports</h3><button class="btn ghost sm" onclick="Moderation.loadReports()">Refresh</button></div>
+        <div id="reportList"></div>
+
+        <div class="card"><h3 style="margin:0 0 8px;font-size:14px;">Dashboard summary</h3><div id="modSummary" class="hint">Log in as Admin / SL Team and open this tab to load.</div></div>
+      </div>
+
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="feedModal">
+  <div class="modal">
+    <div class="modal-head"><h3>Create Post</h3><div class="modal-close" onclick="Feed.closeComposer()">&#10005;</div></div>
+    <div class="modal-body">
+      <div class="modal-user"><div class="avatar sm" id="composerAvatar">?</div><div class="name" id="composerName">You</div></div>
+      <textarea id="feedContent" placeholder="What's on your mind?"></textarea>
+      <div class="divider"></div>
+      <div class="field-row">
+        <div class="field"><label>Post to channel (optional)</label><select id="feedComposerChannel"></select></div>
+        <div class="field"><label>Post to group (optional)</label><select id="feedComposerGroup"></select></div>
+      </div>
+      <div class="field-row">
+        <div class="field"><label>Linked product type</label>
+          <select id="feedLinkType"><option value="">None</option><option value="music_publication">Music Publication</option><option value="course">Academy Course</option></select>
+        </div>
+        <div class="field"><label>Product title</label><input id="feedLinkTitle" placeholder="e.g. Psalm 23 (Klosner)"></div>
+      </div>
+      <div class="field"><label>Product URL</label><input id="feedLinkUrl" placeholder="https://..."></div>
+    </div>
+    <div class="modal-foot">
+      <div class="attach-row">
+        <div class="attach-btn" title="Attach images" onclick="document.getElementById('feedImages').click()">&#128247;</div>
+        <input type="file" id="feedImages" multiple accept="image/*" onchange="Feed.previewImages()">
+        <span class="hint" id="feedImgCount">Last Post</span>
+      </div>
+      <button class="btn" onclick="Feed.createPost()">Post</button>
+    </div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="discModal">
+  <div class="modal">
+    <div class="modal-head"><h3>Start a Discussion</h3><div class="modal-close" onclick="Discussions.closeComposer()">&#10005;</div></div>
+    <div class="modal-body">
+      <div class="field"><label>Title</label><input id="discTitle" placeholder="e.g. Best hymn arrangements for a small choir?"></div>
+      <div class="field"><label>Body</label><textarea id="discBody" placeholder="Add detail so the community can help..." style="min-height:90px;"></textarea></div>
+      <div class="field-row">
+        <div class="field"><label>Category</label><input id="discCategory" placeholder="e.g. Liturgy"></div>
+        <div class="field"><label>Post to group (optional)</label><select id="discComposerGroup"></select></div>
+      </div>
+    </div>
+    <div class="modal-foot"><div></div><button class="btn" onclick="Discussions.createThread()">Create Thread</button></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="groupModal">
+  <div class="modal">
+    <div class="modal-head"><h3>Create a Group</h3><div class="modal-close" onclick="Groups.closeComposer()">&#10005;</div></div>
+    <div class="modal-body">
+      <div class="field-row">
+        <div class="field"><label>Name</label><input id="groupName" placeholder="e.g. St. Mary's Parish Choir"></div>
+        <div class="field"><label>Type</label>
+          <select id="groupType"><option value="general">General</option><option value="diocesan">Diocesan</option><option value="parish">Parish</option><option value="composer">Composer</option><option value="interest">Interest</option></select>
+        </div>
+      </div>
+      <div class="field"><label>Description</label><textarea id="groupDesc" style="min-height:70px;"></textarea></div>
+      <div class="field"><label>Visibility</label>
+        <select id="groupVisibility"><option value="public">Public</option><option value="private">Private (requires approval)</option></select>
+      </div>
+    </div>
+    <div class="modal-foot"><div></div><button class="btn" onclick="Groups.createGroup()">Create Group</button></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="channelModal">
+  <div class="modal">
+    <div class="modal-head"><h3>Create Channel</h3><div class="modal-close" onclick="Channels.closeComposer()">&#10005;</div></div>
+    <div class="modal-body">
+      <div class="field-row">
+        <div class="field"><label>Name</label><input id="chName" placeholder="e.g. Composer Corner"></div>
+        <div class="field"><label>Type</label>
+          <select id="chType"><option value="global">Global</option><option value="composer">Composer-only</option><option value="parish">Parish</option><option value="diocesan">Diocesan</option><option value="private">Private</option></select>
+        </div>
+      </div>
+      <div class="field"><label>Description</label><textarea id="chDesc" style="min-height:70px;"></textarea></div>
+      <div class="hint">Requires an Admin / SL Team account — you'll get a 403 toast otherwise, which is expected.</div>
+    </div>
+    <div class="modal-foot"><div></div><button class="btn" onclick="Channels.createChannel()">Create Channel</button></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="prayerModal">
+  <div class="modal">
+    <div class="modal-head"><h3>Post a Prayer Request</h3><div class="modal-close" onclick="Prayer.closeComposer()">&#10005;</div></div>
+    <div class="modal-body">
+      <div class="field"><label>Title (optional)</label><input id="prayerTitle"></div>
+      <div class="field"><label>Request</label><textarea id="prayerContent" placeholder="Please pray for..." style="min-height:90px;"></textarea></div>
+      <div class="field"><label><input type="checkbox" id="prayerAnon" style="width:auto;"> Post anonymously</label></div>
+    </div>
+    <div class="modal-foot"><div></div><button class="btn" onclick="Prayer.createRequest()">Post</button></div>
+  </div>
+</div>
+
+<div class="modal-overlay" id="dmModal">
+  <div class="modal">
+    <div class="modal-head"><h3>Start a Conversation</h3><div class="modal-close" onclick="Messaging.closeComposer()">&#10005;</div></div>
+    <div class="modal-body">
+      <div class="field"><label>Recipient user ID</label><input id="dmRecipientId" placeholder="e.g. 4"></div>
+      <div class="hint">Log in as a second test user in another browser tab to try real two-way messaging.</div>
+    </div>
+    <div class="modal-foot"><div></div><button class="btn" onclick="Messaging.startDirect()">Start chat</button></div>
+  </div>
+</div>
+
+<div class="toast-wrap" id="toasts"></div>
+
+<div class="lock-overlay" id="loginOverlay">
+  <div class="login-card">
+    <div class="logo brand">&#9670; SL Community</div>
+    <div class="sub">Sign in to test the Community Portal</div>
+    <div class="field"><label>API base URL</label><input id="loginApiBase" value="http://localhost:5000/api"></div>
+    <div class="field"><label>Email</label><input id="loginEmail" placeholder="you@example.com"></div>
+    <div class="field"><label>Password</label><input id="loginPassword" type="password" placeholder="••••••••"></div>
+    <button class="btn" onclick="Auth.login()">Log in</button>
+    <div class="switch-user">Testing DMs or approvals? <button onclick="Auth.showSecondUserHint()">Open this file in a second tab</button> and log in as another account.</div>
+  </div>
+</div>
+
+<script>
+const state = {
+  apiBase: 'http://localhost:5000/api',
+  socketBase: 'http://localhost:5000',
+  token: null,
+  user: null,
+  socket: null,
+  channels: [],
+  groups: [],
+  conversations: [],
+  activeConversationId: null,
+  openPostComments: new Set(),
+  openThreadId: null
+};
+
+function toast(msg, type){
+  const wrap = document.getElementById('toasts');
+  const el = document.createElement('div');
+  el.className = 'toast' + (type ? ' ' + type : '');
+  el.textContent = msg;
+  wrap.appendChild(el);
+  setTimeout(()=>{ el.style.opacity='0'; el.style.transition='opacity .25s'; setTimeout(()=>el.remove(), 250); }, 3600);
+}
+
+function esc(str){
+  if(str===null || str===undefined) return '';
+  return String(str).replace(/[&<>"']/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+}
+function initials(name){
+  if(!name) return '?';
+  return name.trim().split(/\s+/).map(p=>p[0]).slice(0,2).join('').toUpperCase();
+}
+function timeAgo(iso){
+  if(!iso) return '';
+  const d = new Date(iso), s = Math.floor((Date.now()-d.getTime())/1000);
+  if(s<60) return 'just now';
+  if(s<3600) return Math.floor(s/60)+'m ago';
+  if(s<86400) return Math.floor(s/3600)+'h ago';
+  if(s<604800) return Math.floor(s/86400)+'d ago';
+  return d.toLocaleDateString();
+}
+function statusDotFor(userId){
+  if(!userId) return 'online';
+  return (userId % 3 === 0) ? 'away' : 'online';
+}
+
+async function api(path, opts){
+  opts = opts || {};
+  const headers = opts.headers || {};
+  if(state.token) headers['Authorization'] = 'Bearer ' + state.token;
+  let body = opts.body;
+  if(body && !(body instanceof FormData)){
+    headers['Content-Type'] = 'application/json';
+    body = JSON.stringify(body);
+  }
+  let res, data;
+  try{
+    res = await fetch(state.apiBase + path, { method: opts.method || 'GET', headers, body });
+  }catch(e){
+    toast('Network error — is the backend running at ' + state.apiBase + '?', 'err');
+    throw e;
+  }
+  try{ data = await res.json(); }catch(e){ data = { success:false, message:'Invalid JSON response' }; }
+  if(!res.ok || data.success === false){
+    toast(data.message || ('Request failed (' + res.status + ')'), 'err');
+    throw new Error(data.message || 'Request failed');
+  }
+  return data.data;
+}
+
+function openModal(id){ document.getElementById(id).classList.add('open'); }
+function closeModal(id){ document.getElementById(id).classList.remove('open'); }
+
+const Auth = {
+  async login(){
+    const apiBase = document.getElementById('loginApiBase').value.trim();
+    const email = document.getElementById('loginEmail').value.trim();
+    const password = document.getElementById('loginPassword').value;
+    if(!email || !password){ toast('Enter email and password', 'err'); return; }
+    state.apiBase = apiBase || state.apiBase;
+    document.getElementById('apiBase').value = state.apiBase;
+    try{
+      const data = await api('/auth/login', { method:'POST', body:{ email, password } });
+      state.token = data.token;
+      state.user = data.user;
+      document.getElementById('loginOverlay').style.display = 'none';
+      App.renderUserChip();
+      App.connectSocket();
+      App.loadCommonData();
+      Feed.load();
+      toast('Welcome back, ' + (state.user.first_name || 'friend') + '!', 'ok');
+    }catch(e){ }
+  },
+  logout(){
+    if(state.socket) state.socket.disconnect();
+    state.token = null; state.user = null; state.socket = null;
+    document.getElementById('loginOverlay').style.display = 'flex';
+    App.renderUserChip();
+  },
+  showSecondUserHint(){
+    toast('Copy this file\'s URL/path and open it in a second browser tab to log in as a different account.', 'ok');
+  }
+};
+
+const railMap = { feed:'railFeed', discussions:'railDisc', groups:'railGroups', messages:'railChat', prayer:'railPrayer' };
+
+const App = {
+  init(){
+    document.querySelectorAll('.nav-item').forEach(el=>{
+      el.addEventListener('click', ()=> App.switchView(el.dataset.view));
+    });
+    Object.keys(railMap).forEach(view=>{
+      document.getElementById(railMap[view]).addEventListener('click', ()=> App.switchView(view));
+    });
+  },
+  toggleSettings(){ document.getElementById('settingsPop').classList.toggle('open'); },
+  switchView(view){
+    document.querySelectorAll('.nav-item').forEach(el=>el.classList.toggle('active', el.dataset.view===view));
+    Object.keys(railMap).forEach(v=> document.getElementById(railMap[v]).classList.toggle('active', v===view));
+    document.querySelectorAll('.view').forEach(el=>el.classList.remove('active'));
+    document.getElementById('view-'+view).classList.add('active');
+    const titles = {
+      feed: ['Feed','Public posts & product links'],
+      discussions: ['Discussion','Topic-based conversations'],
+      groups: ['Groups','Diocesan, parish, composer & interest groups'],
+      messages: ['Group & Private Messages','One-to-one & group chat'],
+      channels: ['Channels','Segmented, role-based access'],
+      prayer: ['Prayers','Community prayer wall'],
+      moderation: ['Moderation','Admin / SL Team tools']
+    };
+    document.getElementById('viewTitle').innerHTML = titles[view][0] + ' <span class="sub">'+titles[view][1]+'</span>';
+    if(view==='discussions') Discussions.load();
+    if(view==='groups') Groups.load();
+    if(view==='messages') Messaging.load();
+    if(view==='channels') Channels.load();
+    if(view==='prayer') Prayer.load();
+    if(view==='moderation'){ Moderation.loadReports(); Moderation.loadSummary(); }
+  },
+  reconnect(){
+    state.apiBase = document.getElementById('apiBase').value.trim() || state.apiBase;
+    state.socketBase = document.getElementById('socketBase').value.trim() || state.socketBase;
+    if(state.token) App.connectSocket();
+    document.getElementById('settingsPop').classList.remove('open');
+    toast('Config applied', 'ok');
+  },
+  renderUserChip(){
+    const area = document.getElementById('userArea');
+    if(!state.user){ area.innerHTML=''; return; }
+    const initialsStr = initials((state.user.first_name||'')+' '+(state.user.last_name||''));
+    area.innerHTML = `
+      <div class="user-chip">
+        <div class="avatar sm">${esc(initialsStr)}</div>
+        <span>${esc(state.user.first_name)} ${esc(state.user.last_name)} <span class="hint">(${esc(state.user.role||'user')})</span></span>
+        <button class="btn ghost sm" style="margin-left:6px;" onclick="Auth.logout()">Log out</button>
+      </div>`;
+    document.getElementById('railAvatar').textContent = initialsStr;
+    document.getElementById('composerAvatar').textContent = initialsStr;
+    document.getElementById('composerName').textContent = state.user.first_name + ' ' + state.user.last_name;
+    App.renderProfilePanel();
+  },
+  renderProfilePanel(){
+    if(!state.user) return;
+    const initialsStr = initials((state.user.first_name||'')+' '+(state.user.last_name||''));
+    const groupRows = (state.groups||[]).slice(0,5).map(g=>`
+      <div class="quick-row" onclick="App.switchView('groups');Groups.viewDetail(${g.id})">
+        <div class="avatar sm" style="background:linear-gradient(135deg,#123256,#2f6fed);">${esc(initials(g.name))}</div>
+        <span class="qname">${esc(g.name)}</span><span class="qcnt">${g.member_count||0}</span>
+      </div>`).join('') || '<div class="empty-mini">No groups yet.</div>';
+    const channelRows = (state.channels||[]).slice(0,5).map(c=>`
+      <div class="quick-row" onclick="App.switchView('feed');document.getElementById('feedChannelFilter').value=${c.id};Feed.load()">
+        <div class="avatar sm">#</div><span class="qname">${esc(c.name)}</span>
+      </div>`).join('') || '<div class="empty-mini">No channels yet.</div>';
+
+    const html = `
+      <div class="profile-card">
+        <div class="cover"></div>
+        <div class="profile-body">
+          <div class="profile-avatar">${esc(initialsStr)}</div>
+          <div class="pname">${esc(state.user.first_name)} ${esc(state.user.last_name)}</div>
+          <div class="prole">${esc(state.user.role || 'community member')}</div>
+          <button class="btn ghost sm">Edit Profile</button>
+        </div>
+      </div>
+      <div class="panel-block">
+        <h4>My Groups <span class="see-all" onclick="App.switchView('groups')">See all</span></h4>
+        ${groupRows}
+      </div>
+      <div class="panel-block">
+        <h4>Channels <span class="see-all" onclick="App.switchView('channels')">See all</span></h4>
+        ${channelRows}
+      </div>`;
+    const p1 = document.getElementById('profilePanel'); if(p1) p1.innerHTML = html;
+    const p2 = document.getElementById('profilePanel2'); if(p2) p2.innerHTML = html;
+  },
+  async loadCommonData(){
+    try{
+      const chData = await api('/community-portal/channels');
+      state.channels = chData.channels || [];
+      App.fillSelect('feedChannelFilter', state.channels, true, 'All channels');
+      App.fillSelect('feedComposerChannel', state.channels, true, 'No channel');
+    }catch(e){}
+    try{
+      const grData = await api('/community-portal/groups?limit=100');
+      state.groups = grData.groups || [];
+      App.fillSelect('feedGroupFilter', state.groups, true, 'All groups');
+      App.fillSelect('feedComposerGroup', state.groups, true, 'No group');
+      App.fillSelect('discComposerGroup', state.groups, true, 'No group');
+    }catch(e){}
+    App.renderProfilePanel();
+  },
+  fillSelect(id, items, includeEmpty, emptyLabel){
+    const sel = document.getElementById(id);
+    if(!sel) return;
+    sel.innerHTML = (includeEmpty ? `<option value="">${esc(emptyLabel)}</option>` : '') +
+      items.map(i=>`<option value="${i.id}">${esc(i.name)}</option>`).join('');
+  },
+  connectSocket(){
+    if(state.socket) state.socket.disconnect();
+    const socket = io(state.socketBase, { path:'/socket.io', auth:{ token: state.token } });
+    state.socket = socket;
+
+    socket.on('connect', ()=>{
+      document.getElementById('socketDot').className = 'conn-dot on';
+      document.getElementById('socketLabel').textContent = 'Live';
+      socket.emit('join_feed');
+      socket.emit('join_prayer_wall');
+      socket.emit('join_moderation');
+    });
+    socket.on('disconnect', ()=>{
+      document.getElementById('socketDot').className = 'conn-dot off';
+      document.getElementById('socketLabel').textContent = 'Socket disconnected';
+    });
+    socket.on('connect_error', (err)=>{
+      document.getElementById('socketDot').className = 'conn-dot off';
+      document.getElementById('socketLabel').textContent = 'Connect failed';
+      toast('Socket connect error: ' + err.message, 'err');
+    });
+
+    socket.on('new_post', (p)=>{ toast('🟢 Live: new post from ' + (p.post.author ? p.post.author.full_name : 'someone'), 'live'); Feed.load(); });
+    socket.on('new_comment', ()=>{ toast('🟢 Live: new comment', 'live'); Feed.load(); });
+    socket.on('post_like_updated', ()=>{ Feed.load(); });
+
+    socket.on('new_thread', ()=>{ toast('🟢 Live: new discussion thread', 'live'); if(document.getElementById('view-discussions').classList.contains('active')) Discussions.load(); });
+    socket.on('new_reply', (d)=>{ toast('🟢 Live: new reply', 'live'); if(state.openThreadId==d.thread_id) Discussions.openThread(d.thread_id); });
+
+    socket.on('new_message', (d)=>{
+      if(state.activeConversationId == d.conversation_id) Messaging.appendLiveMessage(d.message);
+    });
+    socket.on('conversation_updated', ()=>{ toast('🟢 Live: new message', 'live'); Messaging.load(); });
+    socket.on('conversation_created', ()=>{ Messaging.load(); });
+
+    socket.on('new_prayer_request', ()=>{ toast('🟢 Live: new prayer request', 'live'); if(document.getElementById('view-prayer').classList.contains('active')) Prayer.load(); });
+    socket.on('new_prayer_response', ()=>{ toast('🟢 Live: new prayer response', 'live'); });
+    socket.on('prayer_count_updated', ()=>{ if(document.getElementById('view-prayer').classList.contains('active')) Prayer.load(); });
+
+    socket.on('group_member_joined', ()=>{ if(document.getElementById('view-groups').classList.contains('active')) Groups.load(); });
+    socket.on('group_join_approved', (d)=>{ toast('🎉 Your join request for group #' + d.group_id + ' was approved!', 'ok'); Groups.load(); });
+
+    socket.on('new_report', ()=>{ toast('🟢 Live: new moderation report', 'live'); if(document.getElementById('view-moderation').classList.contains('active')) Moderation.loadReports(); });
+    socket.on('content_moderated', (d)=>{ toast('🟢 Live: ' + d.content_type + ' #' + d.content_id + ' ' + d.action, 'live'); });
+  }
+};
+
+const Feed = {
+  openComposer(){ openModal('feedModal'); },
+  closeComposer(){ closeModal('feedModal'); document.getElementById('feedContent').value=''; document.getElementById('feedImages').value=''; document.getElementById('feedImgCount').textContent='Last Post'; },
+  previewImages(){
+    const files = document.getElementById('feedImages').files;
+    document.getElementById('feedImgCount').textContent = files.length ? (files.length + ' image(s) attached') : 'Last Post';
+  },
+  async createPost(){
+    const content = document.getElementById('feedContent').value.trim();
+    if(!content){ toast('Write something first', 'err'); return; }
+    const fd = new FormData();
+    fd.append('content', content);
+    const ch = document.getElementById('feedComposerChannel').value;
+    const gr = document.getElementById('feedComposerGroup').value;
+    if(ch) fd.append('channel_id', ch);
+    if(gr) fd.append('group_id', gr);
+    const linkType = document.getElementById('feedLinkType').value;
+    if(linkType){
+      fd.append('linked_product_type', linkType);
+      fd.append('linked_product_title', document.getElementById('feedLinkTitle').value);
+      fd.append('linked_product_url', document.getElementById('feedLinkUrl').value);
+    }
+    const files = document.getElementById('feedImages').files;
+    for(const f of files) fd.append('images', f);
+    try{
+      await api('/community-portal/feed', { method:'POST', body: fd });
+      toast('Post created', 'ok');
+      Feed.closeComposer();
+      Feed.load();
+    }catch(e){}
+  },
+  async load(){
+    const list = document.getElementById('feedList');
+    list.innerHTML = '<div class="empty">Loading feed…</div>';
+    const ch = document.getElementById('feedChannelFilter').value;
+    const gr = document.getElementById('feedGroupFilter').value;
+    const qs = new URLSearchParams();
+    if(ch) qs.set('channel_id', ch);
+    if(gr) qs.set('group_id', gr);
+    try{
+      const data = await api('/community-portal/feed?' + qs.toString());
+      const posts = data.posts || [];
+      if(!posts.length){ list.innerHTML = '<div class="empty"><div class="big">📭</div>No posts yet. Be the first to share something.</div>'; return; }
+      list.innerHTML = posts.map(Feed.renderPost).join('');
+    }catch(e){ list.innerHTML = '<div class="empty">Could not load feed.</div>'; }
+  },
+  renderPost(p){
+    const author = p.author || {};
+    const images = Array.isArray(p.images) ? p.images : [];
+    const link = p.linked_product_type ? `
+      <div class="link-chip">
+        <span class="lbl">${p.linked_product_type === 'course' ? '🎓 Course' : '🎼 Product'}</span>
+        <a href="${esc(p.linked_product_url||'#')}" target="_blank">${esc(p.linked_product_title || p.linked_product_url || 'View product')}</a>
+      </div>` : '';
+    const open = state.openPostComments.has(p.id);
+    const dot = statusDotFor(author.id);
+    return `
+    <div class="card">
+      <div class="post-head">
+        <div class="avatar">${esc(initials(author.full_name))}<span class="status-dot ${dot}"></span></div>
+        <div class="name-row">
+          <span class="name">${esc(author.full_name || 'Community member')}</span>
+          ${p.is_pinned ? '<span class="badge pinned">Pinned</span>' : ''}
+          <span class="time">${timeAgo(p.created_at)}</span>
+        </div>
+      </div>
+      <div class="post-body">${esc(p.content)}</div>
+      ${images.map(img=>`<img class="post-img" src="${esc(img)}">`).join('')}
+      ${link}
+      <div class="footer-row">
+        <div class="mini-action ${p.liked_by_me?'liked':''}" onclick="Feed.like(${p.id})">👍 ${p.like_count || 0}</div>
+        <div class="mini-action" onclick="Feed.toggleComments(${p.id})">💬 ${p.comment_count || 0}</div>
+        <div class="spacer"></div>
+        <div class="mini-action" onclick="Moderation.quickReport('post', ${p.id})">🚩 Report</div>
+      </div>
+      <div class="comments ${open?'open':''}" id="comments-${p.id}">
+        <div id="commentsList-${p.id}" class="hint">Loading…</div>
+        <div class="reply-row">
+          <input id="commentInput-${p.id}" placeholder="Write a comment..." onkeydown="if(event.key==='Enter')Feed.addComment(${p.id})">
+          <div class="send-btn" onclick="Feed.addComment(${p.id})">&#10148;</div>
+        </div>
+      </div>
+    </div>`;
+  },
+  async like(id){ try{ await api('/community-portal/feed/'+id+'/like', { method:'POST' }); Feed.load(); }catch(e){} },
+  async toggleComments(id){
+    if(state.openPostComments.has(id)){ state.openPostComments.delete(id); }
+    else { state.openPostComments.add(id); await Feed.loadComments(id); }
+    Feed.load();
+  },
+  async loadComments(id){
+    try{
+      const data = await api('/community-portal/feed/'+id+'/comments');
+      const box = document.getElementById('commentsList-'+id);
+      if(!box) return;
+      const comments = data.comments || [];
+      box.innerHTML = comments.length ? comments.map(c=>`
+        <div class="comment"><div class="avatar sm">${esc(initials(c.author?c.author.full_name:''))}</div>
+        <div class="bubble"><span class="cname">${esc(c.author?c.author.full_name:'')}</span>${esc(c.content)}</div></div>
+      `).join('') : '<div class="hint">No comments yet.</div>';
+    }catch(e){}
+  },
+  async addComment(id){
+    const input = document.getElementById('commentInput-'+id);
+    const content = input.value.trim();
+    if(!content) return;
+    try{
+      await api('/community-portal/feed/'+id+'/comments', { method:'POST', body:{ content } });
+      input.value='';
+      state.openPostComments.add(id);
+      await Feed.loadComments(id);
+      Feed.load();
+    }catch(e){}
+  }
+};
+
+const Discussions = {
+  sort: 'latest',
+  openComposer(){ openModal('discModal'); },
+  closeComposer(){ closeModal('discModal'); },
+  init(){
+    document.querySelectorAll('#discSortTabs .pill-tab').forEach(el=>{
+      el.addEventListener('click', ()=>{
+        document.querySelectorAll('#discSortTabs .pill-tab').forEach(e=>e.classList.remove('active'));
+        el.classList.add('active');
+        Discussions.sort = el.dataset.sort;
+        Discussions.load();
+      });
+    });
+  },
+  async createThread(){
+    const title = document.getElementById('discTitle').value.trim();
+    const body = document.getElementById('discBody').value.trim();
+    if(!title || !body){ toast('Title and body are required', 'err'); return; }
+    const group_id = document.getElementById('discComposerGroup').value || undefined;
+    try{
+      await api('/community-portal/discussions', { method:'POST', body:{ title, body, category: document.getElementById('discCategory').value || undefined, group_id } });
+      toast('Thread created', 'ok');
+      document.getElementById('discTitle').value=''; document.getElementById('discBody').value='';
+      Discussions.closeComposer();
+      Discussions.load();
+    }catch(e){}
+  },
+  async load(){
+    const list = document.getElementById('discList');
+    document.getElementById('discThreadDetail').innerHTML = '';
+    state.openThreadId = null;
+    list.innerHTML = '<div class="empty">Loading discussions…</div>';
+    try{
+      const data = await api('/community-portal/discussions?sort=' + Discussions.sort);
+      const threads = data.threads || [];
+      if(!threads.length){ list.innerHTML = '<div class="empty"><div class="big">🗨️</div>No discussion threads yet.</div>'; return; }
+      list.innerHTML = threads.map(t=>{
+        const dot = statusDotFor(t.author_id);
+        return `
+        <div class="card" onclick="Discussions.openThread(${t.id})" style="cursor:pointer;">
+          <div class="post-head">
+            <div class="avatar">${esc(initials(t.author?t.author.full_name:''))}<span class="status-dot ${dot}"></span></div>
+            <div class="name-row">
+              <span class="name">${esc(t.title)}</span>
+              ${t.is_pinned?'<span class="badge pinned">Pinned</span>':''} ${t.is_locked?'<span class="badge locked">Locked</span>':''}
+              <span class="time">${timeAgo(t.created_at)}</span>
+            </div>
+          </div>
+          <div class="post-body">${esc((t.body||'').slice(0,160))}${(t.body||'').length>160?'…':''}</div>
+          <div class="footer-row">
+            <div class="mini-action">💬 ${t.reply_count||0} replies</div>
+            <div class="mini-action">👁 ${t.view_count||0} views</div>
+            <div class="spacer"></div>
+            ${t.category?`<span class="badge">${esc(t.category)}</span>`:''}
+          </div>
+        </div>`;
+      }).join('');
+    }catch(e){ list.innerHTML = '<div class="empty">Could not load discussions.</div>'; }
+  },
+  async openThread(id){
+    state.openThreadId = id;
+    const box = document.getElementById('discThreadDetail');
+    box.innerHTML = '<div class="empty">Loading thread…</div>';
+    try{
+      const data = await api('/community-portal/discussions/' + id);
+      const t = data.thread;
+      const repliesData = await api('/community-portal/discussions/' + id + '/replies');
+      const replies = repliesData.replies || [];
+      box.innerHTML = `
+        <div class="card">
+          <div class="toolbar" style="margin-bottom:6px;">
+            <h3 style="margin:0;font-size:14px;">${esc(t.title)} ${t.is_pinned?'<span class="badge pinned">Pinned</span>':''} ${t.is_locked?'<span class="badge locked">Locked</span>':''}</h3>
+            <div style="display:flex; gap:6px;">
+              <button class="btn ghost sm" onclick="Discussions.pin(${id})">Pin/Unpin</button>
+              <button class="btn ghost sm" onclick="Discussions.lock(${id})">Lock/Unlock</button>
+            </div>
+          </div>
+          <div class="hint">by ${esc(t.author?t.author.full_name:'')} · ${timeAgo(t.created_at)} · ${t.view_count} views</div>
+          <div class="post-body" style="margin-top:8px;">${esc(t.body)}</div>
+          <div class="divider"></div>
+          <h4 style="margin:0 0 10px 0;font-size:13px;">Replies (${replies.length})</h4>
+          ${replies.map(r=>`
+            <div class="comment"><div class="avatar sm">${esc(initials(r.author?r.author.full_name:''))}</div>
+            <div class="bubble"><span class="cname">${esc(r.author?r.author.full_name:'')}</span>${esc(r.content)}<div class="hint">${timeAgo(r.created_at)}</div></div></div>
+          `).join('') || '<div class="hint">No replies yet.</div>'}
+          <div class="reply-row">
+            <input id="replyInput-${id}" placeholder="Write a reply..." onkeydown="if(event.key==='Enter')Discussions.addReply(${id})">
+            <div class="send-btn" onclick="Discussions.addReply(${id})">&#10148;</div>
+          </div>
+        </div>`;
+    }catch(e){ box.innerHTML = '<div class="empty">Could not load thread.</div>'; }
+  },
+  async addReply(id){
+    const input = document.getElementById('replyInput-'+id);
+    const content = input.value.trim();
+    if(!content) return;
+    try{
+      await api('/community-portal/discussions/'+id+'/replies', { method:'POST', body:{ content } });
+      input.value='';
+      Discussions.openThread(id);
+    }catch(e){}
+  },
+  async pin(id){ try{ await api('/community-portal/discussions/'+id+'/pin', {method:'POST'}); Discussions.openThread(id); Discussions.load(); }catch(e){} },
+  async lock(id){ try{ await api('/community-portal/discussions/'+id+'/lock', {method:'POST'}); Discussions.openThread(id); Discussions.load(); }catch(e){} }
+};
+
+const Groups = {
+  typeFilter: '',
+  init(){
+    document.querySelectorAll('#groupTypeTabs .pill-tab').forEach(el=>{
+      el.addEventListener('click', ()=>{
+        document.querySelectorAll('#groupTypeTabs .pill-tab').forEach(e=>e.classList.remove('active'));
+        el.classList.add('active');
+        Groups.typeFilter = el.dataset.type;
+        Groups.load();
+      });
+    });
+  },
+  openComposer(){ openModal('groupModal'); },
+  closeComposer(){ closeModal('groupModal'); },
+  async createGroup(){
+    const name = document.getElementById('groupName').value.trim();
+    if(!name){ toast('Group name required', 'err'); return; }
+    try{
+      await api('/community-portal/groups', { method:'POST', body:{
+        name, description: document.getElementById('groupDesc').value,
+        group_type: document.getElementById('groupType').value,
+        visibility: document.getElementById('groupVisibility').value
+      }});
+      toast('Group created', 'ok');
+      document.getElementById('groupName').value='';
+      Groups.closeComposer();
+      Groups.load();
+      App.loadCommonData();
+    }catch(e){}
+  },
+  async load(){
+    const grid = document.getElementById('groupGrid');
+    document.getElementById('groupDetail').innerHTML = '';
+    grid.innerHTML = '<div class="empty">Loading groups…</div>';
+    const qs = Groups.typeFilter ? ('?type='+Groups.typeFilter) : '';
+    try{
+      const data = await api('/community-portal/groups' + qs);
+      const groups = data.groups || [];
+      if(!groups.length){ grid.innerHTML = '<div class="empty"><div class="big">👥</div>No groups yet.</div>'; return; }
+      grid.innerHTML = groups.map(g=>`
+        <div class="card group-item">
+          <div class="group-cover"></div>
+          <span class="badge ${g.visibility}">${esc(g.visibility)}</span> <span class="badge">${esc(g.group_type)}</span>
+          <h4>${esc(g.name)}</h4>
+          <div class="desc">${esc(g.description||'No description yet.')}</div>
+          <div class="stats">${g.member_count||0} members · by ${esc(g.created_by_name||'—')}</div>
+          <div style="display:flex; gap:6px;">
+            <button class="btn sm" onclick="Groups.join(${g.id})">Join</button>
+            <button class="btn ghost sm" onclick="Groups.viewDetail(${g.id})">View</button>
+          </div>
+        </div>
+      `).join('');
+    }catch(e){ grid.innerHTML = '<div class="empty">Could not load groups.</div>'; }
+  },
+  async join(id){ try{ await api('/community-portal/groups/'+id+'/join', {method:'POST'}); toast('Join request sent', 'ok'); Groups.load(); }catch(e){} },
+  async leave(id){ try{ await api('/community-portal/groups/'+id+'/leave', {method:'POST'}); toast('Left group', 'ok'); Groups.load(); }catch(e){} },
+  async viewDetail(id){
+    const box = document.getElementById('groupDetail');
+    box.innerHTML = '<div class="empty">Loading group…</div>';
+    try{
+      const data = await api('/community-portal/groups/'+id);
+      const membersData = await api('/community-portal/groups/'+id+'/members');
+      const members = membersData.members || [];
+      box.innerHTML = `
+        <div class="card">
+          <div class="toolbar" style="margin-bottom:8px;">
+            <h3 style="margin:0;font-size:14px;">${esc(data.group.name)}</h3>
+            <button class="btn ghost sm" onclick="Groups.leave(${id})">Leave group</button>
+          </div>
+          <div class="hint">${esc(data.group.description||'')}</div>
+          <div class="divider"></div>
+          <h4 style="margin:0 0 8px 0;font-size:13px;">Members (${members.length})</h4>
+          ${members.map(m=>`
+            <div class="post-head">
+              <div class="avatar sm">${esc(initials((m.first_name||'')+' '+(m.last_name||'')))}</div>
+              <div class="name-row"><span class="name">${esc(m.first_name)} ${esc(m.last_name)}</span><span class="badge">${esc(m.role)}</span></div>
+            </div>
+          `).join('') || '<div class="hint">No members loaded.</div>'}
+        </div>`;
+    }catch(e){ box.innerHTML=''; }
+  }
+};
+
+const Messaging = {
+  openComposer(){ openModal('dmModal'); },
+  closeComposer(){ closeModal('dmModal'); },
+  async startDirect(){
+    const recipient_id = document.getElementById('dmRecipientId').value.trim();
+    if(!recipient_id){ toast('Enter a recipient user ID', 'err'); return; }
+    try{
+      const data = await api('/community-portal/messages/conversations', { method:'POST', body:{ recipient_id } });
+      toast('Conversation ready', 'ok');
+      Messaging.closeComposer();
+      await Messaging.load();
+      Messaging.open(data.conversation.id);
+    }catch(e){}
+  },
+  async load(){
+    const list = document.getElementById('convList');
+    try{
+      const data = await api('/community-portal/messages/conversations');
+      state.conversations = data.conversations || [];
+      if(!state.conversations.length){ list.innerHTML = '<div class="empty" style="margin:14px;border:none;">No conversations yet.</div>'; return; }
+      list.innerHTML = state.conversations.map(c=>{
+        const name = c.type==='direct' ? (c.other_participant ? (c.other_participant.first_name+' '+c.other_participant.last_name) : 'Direct chat') : (c.title || 'Group chat');
+        const last = c.last_message ? (c.last_message.content || '📎 Attachment') : 'No messages yet';
+        return `<div class="conv-item ${state.activeConversationId==c.id?'active':''}" onclick="Messaging.open(${c.id})">
+          <div class="avatar sm">${esc(initials(name))}</div>
+          <div class="meta"><div class="cname">${esc(name)}</div><div class="last">${esc(last)}</div></div>
+          ${c.unread_count?('<span class="unread">'+c.unread_count+'</span>'):''}
+        </div>`;
+      }).join('');
+    }catch(e){ list.innerHTML = '<div class="empty" style="margin:14px;border:none;">Could not load conversations.</div>'; }
+  },
+  async open(id){
+    state.activeConversationId = id;
+    if(state.socket) state.socket.emit('join_conversation', id);
+    Messaging.load();
+    document.getElementById('chatHead').textContent = 'Conversation #' + id;
+    const body = document.getElementById('chatBody');
+    body.innerHTML = '<div class="hint">Loading…</div>';
+    try{
+      const data = await api('/community-portal/messages/conversations/'+id+'/messages');
+      const msgs = data.messages || [];
+      body.innerHTML = msgs.map(Messaging.renderBubble).join('') || '<div class="hint">No messages yet — say hello!</div>';
+      body.scrollTop = body.scrollHeight;
+      await api('/community-portal/messages/conversations/'+id+'/read', { method:'PUT' });
+    }catch(e){ body.innerHTML = '<div class="hint">Could not load messages.</div>'; }
+  },
+  renderBubble(m){
+    const mine = state.user && m.sender_id === state.user.id;
+    return `<div class="msg-bubble ${mine?'me':'them'}">${esc(m.content||'')}<div class="t">${timeAgo(m.created_at)}</div></div>`;
+  },
+  appendLiveMessage(m){
+    const body = document.getElementById('chatBody');
+    if(!body) return;
+    const empty = body.querySelector('.hint');
+    if(empty) body.innerHTML='';
+    body.insertAdjacentHTML('beforeend', Messaging.renderBubble(m));
+    body.scrollTop = body.scrollHeight;
+  },
+  async send(){
+    const id = state.activeConversationId;
+    if(!id){ toast('Open a conversation first', 'err'); return; }
+    const input = document.getElementById('chatInput');
+    const content = input.value.trim();
+    if(!content) return;
+    input.value = '';
+    try{
+      await api('/community-portal/messages/conversations/'+id+'/messages', { method:'POST', body:{ content } });
+      Messaging.open(id);
+    }catch(e){}
+  }
+};
+
+const Channels = {
+  openComposer(){ openModal('channelModal'); },
+  closeComposer(){ closeModal('channelModal'); },
+  async createChannel(){
+    const name = document.getElementById('chName').value.trim();
+    if(!name){ toast('Channel name required', 'err'); return; }
+    try{
+      await api('/community-portal/channels', { method:'POST', body:{
+        name, description: document.getElementById('chDesc').value, channel_type: document.getElementById('chType').value
+      }});
+      toast('Channel created', 'ok');
+      Channels.closeComposer();
+      Channels.load();
+      App.loadCommonData();
+    }catch(e){}
+  },
+  async load(){
+    const grid = document.getElementById('channelGrid');
+    grid.innerHTML = '<div class="empty">Loading channels…</div>';
+    try{
+      const data = await api('/community-portal/channels');
+      const channels = data.channels || [];
+      if(!channels.length){ grid.innerHTML = '<div class="empty"><div class="big">#</div>No channels visible to you yet.</div>'; return; }
+      grid.innerHTML = channels.map(c=>`
+        <div class="card group-item">
+          <span class="badge">${esc(c.channel_type)}</span>
+          <h4>#${esc(c.name)}</h4>
+          <div class="desc">${esc(c.description||'No description.')}</div>
+          <div class="stats">created by ${esc(c.created_by_name||'—')}</div>
+        </div>
+      `).join('');
+    }catch(e){ grid.innerHTML = '<div class="empty">Could not load channels.</div>'; }
+  }
+};
+
+const Prayer = {
+  status: '',
+  init(){
+    document.querySelectorAll('#prayerStatusTabs .pill-tab').forEach(el=>{
+      el.addEventListener('click', ()=>{
+        document.querySelectorAll('#prayerStatusTabs .pill-tab').forEach(e=>e.classList.remove('active'));
+        el.classList.add('active');
+        Prayer.status = el.dataset.status;
+        Prayer.load();
+      });
+    });
+  },
+  openComposer(){ openModal('prayerModal'); },
+  closeComposer(){ closeModal('prayerModal'); },
+  async createRequest(){
+    const content = document.getElementById('prayerContent').value.trim();
+    if(!content){ toast('Write your prayer request', 'err'); return; }
+    try{
+      await api('/community-portal/prayer-intentions', { method:'POST', body:{
+        title: document.getElementById('prayerTitle').value || undefined,
+        content, is_anonymous: document.getElementById('prayerAnon').checked
+      }});
+      toast('Prayer request posted', 'ok');
+      document.getElementById('prayerContent').value='';
+      Prayer.closeComposer();
+      Prayer.load();
+    }catch(e){}
+  },
+  async load(){
+    const list = document.getElementById('prayerList');
+    list.innerHTML = '<div class="empty">Loading prayer wall…</div>';
+    const qs = Prayer.status ? ('?status='+Prayer.status) : '';
+    try{
+      const data = await api('/community-portal/prayer-intentions' + qs);
+      const items = data.prayer_intentions || [];
+      if(!items.length){ list.innerHTML = '<div class="empty"><div class="big">🙏</div>No prayer requests yet.</div>'; return; }
+      list.innerHTML = items.map(p=>`
+        <div class="card">
+          <div class="post-head">
+            <div class="avatar">${esc(initials(p.author?p.author.full_name:'Anonymous'))}<span class="status-dot online"></span></div>
+            <div class="name-row"><span class="name">${esc(p.title || (p.author?p.author.full_name:'Anonymous request'))}</span><span class="badge ${p.status==='answered'?'public':''}">${esc(p.status)}</span><span class="time">${timeAgo(p.created_at)}</span></div>
+          </div>
+          <div class="post-body">${esc(p.content)}</div>
+          <div class="footer-row">
+            <div class="mini-action ${p.prayed_by_me?'liked':''}" onclick="Prayer.pray(${p.id})">🙏 Praying (${p.pray_count||0})</div>
+            <div class="mini-action" onclick="Prayer.toggleResponses(${p.id})">💬 Responses (${p.response_count||0})</div>
+            <div class="spacer"></div>
+            ${p.status!=='answered' ? `<div class="mini-action" onclick="Prayer.markAnswered(${p.id})">✅ Mark answered</div>` : ''}
+          </div>
+          <div class="comments" id="prayerResponses-${p.id}">
+            <div id="prayerResponsesList-${p.id}" class="hint">Loading…</div>
+            <div class="reply-row">
+              <input id="prayerResponseInput-${p.id}" placeholder="Send words of support..." onkeydown="if(event.key==='Enter')Prayer.addResponse(${p.id})">
+              <div class="send-btn" onclick="Prayer.addResponse(${p.id})">&#10148;</div>
+            </div>
+          </div>
+        </div>
+      `).join('');
+    }catch(e){ list.innerHTML = '<div class="empty">Could not load prayer wall.</div>'; }
+  },
+  async pray(id){ try{ await api('/community-portal/prayer-intentions/'+id+'/pray', {method:'POST'}); Prayer.load(); }catch(e){} },
+  async markAnswered(id){ try{ await api('/community-portal/prayer-intentions/'+id, {method:'PUT', body:{status:'answered'}}); toast('Marked as answered','ok'); Prayer.load(); }catch(e){} },
+  async toggleResponses(id){
+    const box = document.getElementById('prayerResponses-'+id);
+    box.classList.toggle('open');
+    if(box.classList.contains('open')) Prayer.loadResponses(id);
+  },
+  async loadResponses(id){
+    try{
+      const data = await api('/community-portal/prayer-intentions/'+id+'/responses');
+      const box = document.getElementById('prayerResponsesList-'+id);
+      const responses = data.responses || [];
+      box.innerHTML = responses.length ? responses.map(r=>`
+        <div class="comment"><div class="avatar sm">${esc(initials(r.author?r.author.full_name:''))}</div>
+        <div class="bubble"><span class="cname">${esc(r.author?r.author.full_name:'')}</span>${esc(r.content)}</div></div>
+      `).join('') : '<div class="hint">No responses yet.</div>';
+    }catch(e){}
+  },
+  async addResponse(id){
+    const input = document.getElementById('prayerResponseInput-'+id);
+    const content = input.value.trim();
+    if(!content) return;
+    try{
+      await api('/community-portal/prayer-intentions/'+id+'/responses', { method:'POST', body:{ content } });
+      input.value='';
+      Prayer.loadResponses(id);
+      Prayer.load();
+    }catch(e){}
+  }
+};
+
+const Moderation = {
+  async report(){
+    const content_type = document.getElementById('repType').value;
+    const content_id = document.getElementById('repId').value.trim();
+    const reason = document.getElementById('repReason').value.trim();
+    if(!content_id || !reason){ toast('Content ID and reason are required', 'err'); return; }
+    try{
+      await api('/community-portal/moderation/report', { method:'POST', body:{ content_type, content_id, reason } });
+      toast('Report submitted', 'ok');
+      document.getElementById('repId').value=''; document.getElementById('repReason').value='';
+    }catch(e){}
+  },
+  quickReport(content_type, content_id){
+    App.switchView('moderation');
+    document.getElementById('repType').value = content_type;
+    document.getElementById('repId').value = content_id;
+    toast('Add a reason below and submit', 'ok');
+  },
+  async action(type){
+    const content_type = document.getElementById('modType').value;
+    const content_id = document.getElementById('modId').value.trim();
+    if(!content_id){ toast('Enter a content ID', 'err'); return; }
+    const path = type==='remove' ? '/community-portal/moderation/content' : '/community-portal/moderation/content/'+type;
+    const method = type==='remove' ? 'DELETE' : 'POST';
+    try{
+      await api(path, { method, body:{ content_type, content_id } });
+      toast('Action applied: ' + type, 'ok');
+    }catch(e){}
+  },
+  async loadReports(){
+    const list = document.getElementById('reportList');
+    list.innerHTML = '<div class="empty">Loading reports…</div>';
+    try{
+      const data = await api('/community-portal/moderation/reports?status=pending');
+      const reports = data.reports || [];
+      if(!reports.length){ list.innerHTML = '<div class="empty">No pending reports.</div>'; return; }
+      list.innerHTML = reports.map(r=>`
+        <div class="card">
+          <div class="post-head">
+            <div class="name-row"><span class="name">${esc(r.content_type)} #${r.content_id} — ${esc(r.reason)}</span><span class="time">${timeAgo(r.created_at)}</span></div>
+          </div>
+          <div class="hint">reported by ${esc(r.reporter_first_name)} ${esc(r.reporter_last_name)}</div>
+          ${r.details ? `<div class="hint">${esc(r.details)}</div>` : ''}
+          <div class="footer-row">
+            <div class="mini-action" onclick="Moderation.resolve(${r.id},'dismissed')">Dismiss</div>
+            <div class="mini-action" onclick="Moderation.resolve(${r.id},'action_taken')">Mark action taken</div>
+          </div>
+        </div>
+      `).join('');
+    }catch(e){ list.innerHTML = '<div class="empty">Could not load reports (Admin / SL Team only).</div>'; }
+  },
+  async resolve(id, status){
+    try{ await api('/community-portal/moderation/reports/'+id, { method:'PUT', body:{ status } }); toast('Report updated', 'ok'); Moderation.loadReports(); }catch(e){}
+  },
+  async loadSummary(){
+    const box = document.getElementById('modSummary');
+    try{
+      const data = await api('/community-portal/moderation/summary');
+      box.innerHTML = `
+        <div style="display:flex; gap:18px; flex-wrap:wrap;">
+          <div><b>${data.total_posts}</b><div class="hint">Posts</div></div>
+          <div><b>${data.total_discussion_threads}</b><div class="hint">Threads</div></div>
+          <div><b>${data.total_groups}</b><div class="hint">Groups</div></div>
+          <div><b>${data.total_prayer_intentions}</b><div class="hint">Prayer requests</div></div>
+          <div><b>${data.pending_reports}</b><div class="hint">Pending reports</div></div>
+        </div>`;
+    }catch(e){ box.textContent = 'Admin / SL Team access required.'; }
+  }
+};
+
+App.init();
+Discussions.init();
+Groups.init();
+Prayer.init();
+</script>
+</body>
+</html>

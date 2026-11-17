@@ -13,6 +13,7 @@ const https = require("https");
 const http = require("http");
 const { PutObjectCommand } = require("@aws-sdk/client-s3");
 const { s3: s3Client, BUCKET_NAME } = require("../config/s3");
+const { logReviewBoardStipend } = require("../utils/royaltyEngine");
 const {
   sendMusicSubmissionEmail,
   sendMusicReviewStatusStage1,
@@ -252,6 +253,9 @@ const formatMusicPublication = (pub) => {
     signedContractUrlTime: pub.signedContractUrlTime,
     finalContract: pub.finalContract,
     finalContractTime: pub.finalContractTime,
+    ContractHTMLJSON: parse(pub.ContractHTMLJSON, null),
+    adminContractHTML: pub.adminContractHTML,
+    composerContractHTML: pub.composerContractHTML,
 
     // =========================
     // STAGE 1
@@ -776,6 +780,15 @@ router.post(
         updateFields.push("signedContractUrl = ?");
         updateFields.push("signedContractUrlTime = NOW()");
         updateValues.push(req.body.signedContractUrl);
+      }
+      if (req.body.ContractHTMLJSON !== undefined) {
+        updateFields.push("ContractHTMLJSON = ?");
+        const chj = req.body.ContractHTMLJSON;
+        updateValues.push(chj ? (typeof chj === "string" ? chj : JSON.stringify(chj)) : null);
+      }
+      if (req.body.composerContractHTML !== undefined) {
+        updateFields.push("composerContractHTML = ?");
+        updateValues.push(req.body.composerContractHTML);
       }
       // Collection Information
       if (req.body.isPartOfCollection !== undefined) {
@@ -3457,6 +3470,20 @@ router.post(
         updateValues
       );
 
+      if (req.user.badges && req.user.badges.includes("Review Board")) {
+        /* =====================================
+           🔥 ROYALTY ENGINE: log Review Board stipend
+           (flat rate per SOW 7.2, keyed by types_of_music -
+           never blocks the decision response on failure)
+        ===================================== */
+        await logReviewBoardStipend({
+          mysql: mysqlConnection,
+          reviewerId: req.user.id,
+          musicPublicationId: id,
+          typeOfMusic: currentState.types_of_music,
+          compositionTitle: currentState.composition_title
+        });
+      }
       /* =====================================
          EMAIL ONLY AFTER 2 REVIEWS
       ===================================== */
@@ -5864,6 +5891,9 @@ router.post(
         notes,
         price,
         musicFiles,
+        ContractHTMLJSON,
+        adminContractHTML,
+        composerContractHTML,
         // Metadata fields that can be updated
         composition_title,
         composition_description,
@@ -5932,13 +5962,11 @@ router.post(
       // Both 'approved' and 'accept_with_changes' lead to published, only 'rejected' stops
       const isApproved =
         decision === "approved" || decision === "accept_with_changes";
-      const isAdminUser =
-        req.user?.user_type === "admin" || hasBadge(req.user, "Admin");
       let nextStage;
       let nextStatus;
       if (isApproved) {
         nextStage = "published";
-        nextStatus = isAdminUser ? "draft" : "published";
+        nextStatus = "published";
       } else {
         nextStage = "rejected";
         nextStatus = "rejected";
@@ -6101,6 +6129,21 @@ router.post(
       if (Array.isArray(musicFiles)) {
         fields.push("music_files = ?");
         values.push(JSON.stringify(musicFiles));
+      }
+
+      if (ContractHTMLJSON !== undefined) {
+        fields.push("ContractHTMLJSON = ?");
+        values.push(ContractHTMLJSON ? (typeof ContractHTMLJSON === "string" ? ContractHTMLJSON : JSON.stringify(ContractHTMLJSON)) : null);
+      }
+
+      if (adminContractHTML !== undefined) {
+        fields.push("adminContractHTML = ?");
+        values.push(adminContractHTML);
+      }
+
+      if (composerContractHTML !== undefined) {
+        fields.push("composerContractHTML = ?");
+        values.push(composerContractHTML);
       }
 
       // Allow optional price only when approving

@@ -2599,4 +2599,140 @@ router.get("/export", async (req, res) => {
   }
 });
 
+// @route   POST /api/subscriptions/admin/run-expiry-check
+// @desc    Manually trigger the same job the daily cron runs
+//          (30-day reminder, 7-day reminder, expire + downgrade
+//          to free). Useful for testing without waiting for
+//          the scheduled 11:30 AM run.
+// @access  Private (SL Team)
+router.post('/admin/run-expiry-check', auth, requireAnyRole(['sl_team']), async (req, res) => {
+    try {
+        const { runSubscriptionExpiryJob } = require('../utils/subscriptionCronJobs');
+        const results = await runSubscriptionExpiryJob();
+        return successResponse(res, results, 'Subscription expiry check completed');
+    } catch (error) {
+        console.error('❌ Manual expiry check error:', error);
+        return errorResponse(res, 'Failed to run subscription expiry check', 500);
+    }
+});
+
+// @route   GET /api/subscriptions/admin/expiry-reminder-logs
+// @desc    History of every expiry-related email sent by the
+//          cron job — who got which reminder (30_day / 7_day /
+//          expired) and when, with pagination + search + filters.
+// @access  Private (SL Team)
+// @query   search (email/plan name), reminder_type, status,
+//          user_id, start_date, end_date, page, limit,
+//          all=true -> skip pagination (capped at 5000 rows)
+router.get('/admin/expiry-reminder-logs', auth, requireAnyRole(['sl_team']), async (req, res) => {
+    try {
+        const mysqlConnection = getMySQLConnection();
+        const {
+            search,
+            reminder_type,
+            status,
+            user_id,
+            start_date,
+            end_date,
+            page = 1,
+            limit = 20,
+            all
+        } = req.query;
+
+        const conditions = ['1 = 1'];
+        const params = [];
+
+        if (search) {
+            conditions.push('(r.email LIKE ? OR r.plan_name LIKE ? OR u.first_name LIKE ? OR u.last_name LIKE ?)');
+            const like = `%${search}%`;
+            params.push(like, like, like, like);
+        }
+        if (reminder_type) {
+            conditions.push('r.reminder_type = ?');
+            params.push(reminder_type);
+        }
+        if (status) {
+            conditions.push('r.status = ?');
+            params.push(status);
+        }
+        if (user_id) {
+            conditions.push('r.user_id = ?');
+            params.push(user_id);
+        }
+        if (start_date) {
+            conditions.push('r.sent_at >= ?');
+            params.push(`${start_date} 00:00:00`);
+        }
+        if (end_date) {
+            conditions.push('r.sent_at <= ?');
+            params.push(`${end_date} 23:59:59`);
+        }
+
+        const whereClause = `WHERE ${conditions.join(' AND ')}`;
+        const fetchAll = String(all).toLowerCase() === 'true';
+
+        const baseSelect = `
+            SELECT
+                r.id, r.subscription_id, r.user_id, r.email, r.plan_name,
+                r.reminder_type, r.status, r.error_message, r.sent_at,
+                u.first_name, u.last_name
+            FROM subscription_expiry_reminders r
+            LEFT JOIN users u ON r.user_id = u.id
+            ${whereClause}
+            ORDER BY r.sent_at DESC
+        `;
+
+        let logs;
+        let pagination = null;
+
+        if (fetchAll) {
+            [logs] = await mysqlConnection.execute(`${baseSelect} LIMIT 5000`, params);
+        } else {
+            const parsedLimit = Math.min(parseInt(limit) || 20, 100);
+            const parsedPage = Math.max(parseInt(page) || 1, 1);
+            const offset = (parsedPage - 1) * parsedLimit;
+
+            [logs] = await mysqlConnection.execute(
+                `${baseSelect} LIMIT ${parsedLimit} OFFSET ${offset}`,
+                params
+            );
+
+            const [[{ total }]] = await mysqlConnection.execute(
+                `SELECT COUNT(*) AS total
+                 FROM subscription_expiry_reminders r
+                 LEFT JOIN users u ON r.user_id = u.id
+                 ${whereClause}`,
+                params
+            );
+
+            pagination = {
+                page: parsedPage,
+                limit: parsedLimit,
+                total,
+                total_pages: Math.max(Math.ceil(total / parsedLimit), 1)
+            };
+        }
+
+        return successResponse(
+            res,
+            { logs, pagination },
+            'Expiry reminder email history fetched successfully'
+        );
+    } catch (error) {
+        console.error('❌ Get expiry reminder logs error:', error);
+        return errorResponse(res, 'Failed to fetch expiry reminder logs', 500);
+    }
+});
+
+/* ============================================================
+   Shared helper exported for reuse by the subscription cron
+   job (utils/subscriptionCronJobs.js) — same free-plan downgrade
+   logic used by the self-expire / admin-expire routes above, so
+   the cron job never has to duplicate it.
+   Express routers are functions, so attaching a property on
+   `router` is safe — require("./subscriptions") still works as
+   a router in server.js exactly as before.
+============================================================ */
+router.applyFreePlanPermissionsToUser = applyFreePlanPermissionsToUser;
+
 module.exports = router;

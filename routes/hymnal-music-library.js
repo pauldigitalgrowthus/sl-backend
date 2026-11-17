@@ -544,8 +544,11 @@ router.get('/songs', auth, async (req, res) => {
             const personalMusicData = parseJsonSafe(row.user_personal_music, {});
             const userPersonalEntries = personalMusicData[finalUserId] || [];
 
+            // ✅ Exclude user_personal_music from response
+            const { user_personal_music, ...rowWithoutPersonalMusic } = row;
+
             return {
-                ...row,
+                ...rowWithoutPersonalMusic,
 
                 categories: categoryIds
                     .map(id => categoriesMap[id])
@@ -1033,19 +1036,19 @@ router.post('/songs/bulk-upload', [auth, upload.single('file')], async (req, res
            STEP 2 — FETCH LOOKUP DATA (Categories / Music Types)
         ══════════════════════════════════════════ */
 
-        // Categories → map  "category name (year)" → id
+        // Categories → map  "category name (year)" → category object
         const [categories] = await mysql.execute(
-            `SELECT id, category_name, edition_year FROM hymnal_categories ORDER BY category_name ASC`
+            `SELECT id, category_name, edition_year, hymanl_abbrevation FROM hymnal_categories ORDER BY category_name ASC`
         );
 
         const categoryMap = {};
         categories.forEach(c => {
             // match exact label used in dropdown: "Category Name (Year)"
             const label = `${c.category_name} (${c.edition_year})`.toLowerCase().trim();
-            categoryMap[label] = c.id;
+            categoryMap[label] = c;
 
             // also allow plain category_name match as fallback
-            categoryMap[c.category_name.toLowerCase().trim()] = c.id;
+            categoryMap[c.category_name.toLowerCase().trim()] = c;
         });
 
         // Music Types → map  name → id
@@ -1123,12 +1126,12 @@ router.post('/songs/bulk-upload', [auth, upload.single('file')], async (req, res
 
             try {
                 /* ── Column Mapping ── */
-                const hymnTitle      = (row['Hymn Title']        || '').trim();
-                const hymnAuthor     = (row['Hymn Author']       || '').trim();
-                const categoryRaw    = (row['Category Name']     || '').trim();
-                const hymnNumberRaw  = (row['Hymn Number']       || '').trim();
-                const audioPreview   = (row['Audio Preview URL'] || '').trim();
-                const musicTypeRaw   = (row['Music Type']        || '').trim();
+                const hymnTitle = (row['Hymn Title'] || '').trim();
+                const hymnAuthor = (row['Hymn Author'] || '').trim();
+                const categoryRaw = (row['Category Name'] || '').trim();
+                const hymnNumberRaw = (row['Hymn Number'] || '').trim();
+                const audioPreview = (row['Audio Preview URL'] || '').trim();
+                const musicTypeRaw = (row['Music Type'] || '').trim();
 
                 /* ── Required Field Validation ── */
                 if (!hymnTitle) {
@@ -1145,29 +1148,18 @@ router.post('/songs/bulk-upload', [auth, upload.single('file')], async (req, res
                 }
 
                 /* ── Resolve Category ID ── */
-                const categoryId = categoryMap[categoryRaw.toLowerCase()];
-                if (!categoryId) {
+                const category = categoryMap[categoryRaw.toLowerCase()];
+                if (!category) {
                     throw new Error(`Category not found: "${categoryRaw}". Use the dropdown value from the template.`);
                 }
+                const categoryId = category.id;
 
-                /* ── Build Hymn Numbers Object ──
-                   Supports:
-                     single  → "BB-101"         → { "BB": "BB-101" }
-                     multi   → "BB-101, MI-202"  → { "BB": "BB-101", "MI": "MI-202" }
+                /* ── Build Hymn Numbers Object (Format B: Category ID as Key) ──
+                   e.g. { "1": "101" }
                 ── */
-                const hymnNumbers = {};
-                const parts = hymnNumberRaw.split(',').map(p => p.trim()).filter(Boolean);
-
-                parts.forEach(part => {
-                    // extract prefix (everything before first hyphen or digit run)
-                    const match = part.match(/^([A-Za-z]+)/);
-                    const key = match ? match[1].toUpperCase() : `KEY${Object.keys(hymnNumbers).length + 1}`;
-                    hymnNumbers[key] = part;
-                });
-
-                if (!Object.keys(hymnNumbers).length) {
-                    throw new Error('Hymn Number could not be parsed');
-                }
+                const hymnNumbers = {
+                    [String(categoryId)]: hymnNumberRaw
+                };
 
                 /* ── Resolve Music Type (optional) ── */
                 let resolvedMusicType = null;
@@ -1209,7 +1201,7 @@ router.post('/songs/bulk-upload', [auth, upload.single('file')], async (req, res
                     };
 
                     const finalAudioPreview = audioPreview || matchedExisting.audioPreviewUrl || null;
-                    const finalMusicType    = resolvedMusicType || matchedExisting.hymnalMusicType || null;
+                    const finalMusicType = resolvedMusicType || matchedExisting.hymnalMusicType || null;
 
                     await mysql.execute(
                         `UPDATE hymnal_music_library
@@ -1508,9 +1500,9 @@ router.get('/songs/sample-sheet', auth, async (_req, res) => {
         const refSheet = workbook.addWorksheet('_CategoryRef');
         refSheet.state = 'veryHidden';
         refSheet.columns = [
-            { header: 'Label',        key: 'label',        width: 30 },
-            { header: 'ID',           key: 'id',            width: 10 },
-            { header: 'Abbreviation', key: 'abbreviation',  width: 20 },
+            { header: 'Label', key: 'label', width: 30 },
+            { header: 'ID', key: 'id', width: 10 },
+            { header: 'Abbreviation', key: 'abbreviation', width: 20 },
         ];
         categoryRows.forEach(cat => {
             refSheet.addRow({
@@ -1537,30 +1529,29 @@ router.get('/songs/sample-sheet', auth, async (_req, res) => {
 
         /* ══════════════════════════════════════════
            MAIN SHEET columns
-           Hymn Title | Hymn Author | Category Name | Hymnal Abbreviation |
+           Hymn Title | Hymn Author | Category Name |
            Hymn Number | Audio Preview URL | Music Type
         ══════════════════════════════════════════ */
         worksheet.columns = [
-            { header: 'Hymn Title',          key: 'hymnTitle',           width: 28 }, // col A
-            { header: 'Hymn Author',         key: 'hymnAuthor',          width: 24 }, // col B
-            { header: 'Category Name',       key: 'categoryName',        width: 30 }, // col C — dropdown
-            { header: 'Hymnal Abbreviation', key: 'hymnalAbbreviation',  width: 22 }, // col D — auto (VLOOKUP)
-            { header: 'Hymn Number',         key: 'hymnNumber',          width: 18 }, // col E
-            { header: 'Audio Preview URL',   key: 'audioPreviewUrl',     width: 35 }, // col F
-            { header: 'Music Type',          key: 'musicType',           width: 22 }, // col G — dropdown
+            { header: 'Hymn Title', key: 'hymnTitle', width: 28 }, // col A
+            { header: 'Hymn Author', key: 'hymnAuthor', width: 24 }, // col B
+            { header: 'Category Name', key: 'categoryName', width: 30 }, // col C — dropdown
+            { header: 'Hymn Number', key: 'hymnNumber', width: 18 }, // col D
+            { header: 'Audio Preview URL', key: 'audioPreviewUrl', width: 35 }, // col E
+            { header: 'Music Type', key: 'musicType', width: 22 }, // col F — dropdown
         ];
 
         /* ── Header row styling ── */
         const headerRow = worksheet.getRow(1);
         headerRow.eachCell(cell => {
-            cell.font      = { bold: true, color: { argb: 'FFFFFFFF' } };
-            cell.fill      = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F1F1F' } };
+            cell.font = { bold: true, color: { argb: 'FFFFFFFF' } };
+            cell.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FF1F1F1F' } };
             cell.alignment = { vertical: 'middle', horizontal: 'center' };
         });
         headerRow.height = 20;
 
         /* ══════════════════════════════════════════
-           DATA VALIDATION + AUTO FORMULA — rows 2→1001
+           DATA VALIDATION — rows 2→1001
         ══════════════════════════════════════════ */
         for (let r = 2; r <= 1001; r++) {
 
@@ -1574,17 +1565,8 @@ router.get('/songs/sample-sheet', auth, async (_req, res) => {
                 error: 'Please select a category from the dropdown list.',
             };
 
-            /* Col D — Hymnal Abbreviation (auto-filled via VLOOKUP based on Col C) */
-            const abbrCell = worksheet.getCell(`D${r}`);
-            abbrCell.value = {
-                formula: `IF(C${r}="","",IFERROR(VLOOKUP(C${r},_CategoryRef!$A$2:$C$${categoryDropdownLastRow},3,FALSE),""))`,
-            };
-            // Visually mark it as read-only / auto-generated
-            abbrCell.font = { italic: true, color: { argb: 'FF666666' } };
-            abbrCell.protection = { locked: true };
-
-            /* Col G — Music Type dropdown */
-            worksheet.getCell(`G${r}`).dataValidation = {
+            /* Col F — Music Type dropdown */
+            worksheet.getCell(`F${r}`).dataValidation = {
                 type: 'list',
                 allowBlank: true,
                 formulae: [`_MusicTypeRef!$A$2:$A$${musicTypeDropdownLastRow}`],
@@ -1601,33 +1583,13 @@ router.get('/songs/sample-sheet', auth, async (_req, res) => {
         worksheet.getRow(2).getCell(1).value = 'Amazing Grace';                                           // Hymn Title
         worksheet.getRow(2).getCell(2).value = 'John Newton';                                             // Hymn Author
         worksheet.getRow(2).getCell(3).value = `${firstCategory.category_name} (${firstCategory.edition_year})`; // Category Name
-        // Col D (Hymnal Abbreviation) already has the VLOOKUP formula set above; no manual value needed
-        worksheet.getRow(2).getCell(5).value = 'BB-101';                                                  // Hymn Number
-        worksheet.getRow(2).getCell(6).value = 'https://example.com/audio.mp3';                           // Audio Preview URL
-        worksheet.getRow(2).getCell(7).value = firstMusicType ? firstMusicType.name : '';                 // Music Type
+        worksheet.getRow(2).getCell(4).value = '101';                                                     // Hymn Number
+        worksheet.getRow(2).getCell(5).value = 'https://example.com/audio.mp3';                           // Audio Preview URL
+        worksheet.getRow(2).getCell(6).value = firstMusicType ? firstMusicType.name : '';                 // Music Type
 
         /* ── Freeze header + auto-filter ── */
         worksheet.views = [{ state: 'frozen', ySplit: 1 }];
-        worksheet.autoFilter = { from: 'A1', to: 'G1' };
-
-        /* ── Sheet protection so formula in Col D can't be overwritten accidentally ── */
-        await worksheet.protect('', {
-            selectLockedCells: true,
-            selectUnlockedCells: true,
-            formatCells: true,
-            formatColumns: true,
-            formatRows: true,
-            insertRows: true,
-            deleteRows: true,
-            sort: true,
-            autoFilter: true,
-        });
-        // Unlock all editable columns (A, B, C, E, F, G) so only D (abbreviation) stays locked/read-only
-        ['A', 'B', 'C', 'E', 'F', 'G'].forEach(col => {
-            for (let r = 1; r <= 1001; r++) {
-                worksheet.getCell(`${col}${r}`).protection = { locked: false };
-            }
-        });
+        worksheet.autoFilter = { from: 'A1', to: 'F1' };
 
         /* ── Stream to client ── */
         res.setHeader('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
@@ -1753,106 +1715,106 @@ router.get('/songs/sample-sheet', auth, async (_req, res) => {
  * @access  Private
  * @returns { entryId: uuid } - Unique ID for this library entry
  */
-router.post('/personal-library', auth, 
-  hymnalMusicUpload.fields([{ name: 'customFiles', maxCount: 10 }]),
-  async (req, res) => {
-    try {
-      const mysql = getMySQLConnection();
-      const userId = req.user.id;
-      const userType = req.user.user_type;
-      const parentUserId = req.user.parent_user_id;
+router.post('/personal-library', auth,
+    hymnalMusicUpload.fields([{ name: 'customFiles', maxCount: 10 }]),
+    async (req, res) => {
+        try {
+            const mysql = getMySQLConnection();
+            const userId = req.user.id;
+            const userType = req.user.user_type;
+            const parentUserId = req.user.parent_user_id;
 
-      const { hymnalSongId, songName, songAuthor, customNotes, tags } = req.body;
+            const { hymnalSongId, songName, songAuthor, customNotes, tags } = req.body;
 
-      if (!hymnalSongId) {
-        return errorResponse(res, 'hymnalSongId is required', 400);
-      }
+            if (!hymnalSongId) {
+                return errorResponse(res, 'hymnalSongId is required', 400);
+            }
 
-      let finalUserId = userId;
-      if ((userType === 'sub_user' || userType === 'manager') && parentUserId) {
-        finalUserId = parentUserId;
-      }
+            let finalUserId = userId;
+            if ((userType === 'sub_user' || userType === 'manager') && parentUserId) {
+                finalUserId = parentUserId;
+            }
 
-      // ✅ Optimized: Only fetch needed columns
-      const [rows] = await mysql.execute(
-        `SELECT user_personal_music, hymn_title, hymn_author, hymnal_files
+            // ✅ Optimized: Only fetch needed columns
+            const [rows] = await mysql.execute(
+                `SELECT user_personal_music, hymn_title, hymn_author, hymnal_files
          FROM hymnal_music_library
          WHERE id = ? LIMIT 1`,
-        [hymnalSongId]
-      );
+                [hymnalSongId]
+            );
 
-      if (!rows.length) {
-        return errorResponse(res, 'Hymnal song not found', 404);
-      }
+            if (!rows.length) {
+                return errorResponse(res, 'Hymnal song not found', 404);
+            }
 
-      const song = rows[0];
+            const song = rows[0];
 
-      // Process files
-      const customFiles = req.files?.customFiles || [];
-      const customFilesPayload = customFiles.map((file) => ({
-        designation: 'user-uploaded',
-        instruments: [],
-        customInstrument: file.originalname,
-        file: {
-          url: file.location,
-          name: file.originalname,
-          size: file.size,
-          type: file.mimetype
+            // Process files
+            const customFiles = req.files?.customFiles || [];
+            const customFilesPayload = customFiles.map((file) => ({
+                designation: 'user-uploaded',
+                instruments: [],
+                customInstrument: file.originalname,
+                file: {
+                    url: file.location,
+                    name: file.originalname,
+                    size: file.size,
+                    type: file.mimetype
+                }
+            }));
+
+            // Parse existing data
+            let personalMusicData = song.user_personal_music
+                ? JSON.parse(song.user_personal_music)
+                : {};
+
+            if (!personalMusicData[finalUserId]) {
+                personalMusicData[finalUserId] = [];
+            }
+
+            // ✅ Generate unique ID for entry
+            const entryId = uuidv4();
+
+            // ✅ Check duplicates early (before building large object)
+            const exists = personalMusicData[finalUserId].some(
+                item => item.hymnalSongId === hymnalSongId
+            );
+
+            if (exists) {
+                return errorResponse(res, 'This song is already in your personal library', 400);
+            }
+
+            // Build entry with ID
+            const baseSongFiles = parseJsonSafe(song.hymnal_files, []);
+            const mergedSongFiles = [...baseSongFiles, ...customFilesPayload];
+
+            const personalMusicEntry = {
+                id: entryId, // ✅ UNIQUE ID
+                hymnalSongId: hymnalSongId,
+                songName: songName || song.hymn_title,
+                songAuthor: songAuthor || song.hymn_author,
+                songFiles: mergedSongFiles,
+                customNotes: customNotes || null,
+                tags: Array.isArray(tags) ? tags : [],
+                addedAt: new Date().toISOString()
+            };
+
+            personalMusicData[finalUserId].push(personalMusicEntry);
+
+            await mysql.execute(
+                `UPDATE hymnal_music_library SET user_personal_music = ? WHERE id = ?`,
+                [JSON.stringify(personalMusicData), hymnalSongId]
+            );
+
+            successResponse(res, {
+                entryId,
+                ...personalMusicEntry
+            }, 'Song added to personal library');
+        } catch (err) {
+            console.error(err);
+            errorResponse(res, 'Failed to add song to personal library', 500);
         }
-      }));
-
-      // Parse existing data
-      let personalMusicData = song.user_personal_music
-        ? JSON.parse(song.user_personal_music)
-        : {};
-
-      if (!personalMusicData[finalUserId]) {
-        personalMusicData[finalUserId] = [];
-      }
-
-      // ✅ Generate unique ID for entry
-      const entryId = uuidv4();
-
-      // ✅ Check duplicates early (before building large object)
-      const exists = personalMusicData[finalUserId].some(
-        item => item.hymnalSongId === hymnalSongId
-      );
-
-      if (exists) {
-        return errorResponse(res, 'This song is already in your personal library', 400);
-      }
-
-      // Build entry with ID
-      const baseSongFiles = parseJsonSafe(song.hymnal_files, []);
-      const mergedSongFiles = [...baseSongFiles, ...customFilesPayload];
-      
-      const personalMusicEntry = {
-        id: entryId, // ✅ UNIQUE ID
-        hymnalSongId: hymnalSongId,
-        songName: songName || song.hymn_title,
-        songAuthor: songAuthor || song.hymn_author,
-        songFiles: mergedSongFiles,
-        customNotes: customNotes || null,
-        tags: Array.isArray(tags) ? tags : [],
-        addedAt: new Date().toISOString()
-      };
-
-      personalMusicData[finalUserId].push(personalMusicEntry);
-
-      await mysql.execute(
-        `UPDATE hymnal_music_library SET user_personal_music = ? WHERE id = ?`,
-        [JSON.stringify(personalMusicData), hymnalSongId]
-      );
-
-      successResponse(res, { 
-        entryId, 
-        ...personalMusicEntry 
-      }, 'Song added to personal library');
-    } catch (err) {
-      console.error(err);
-      errorResponse(res, 'Failed to add song to personal library', 500);
     }
-  }
 );
 
 /**

@@ -1940,7 +1940,7 @@ router.post('/invite', auth, async (req, res) => {
     createAndDeliverNotification({
       title: "You're Invited to Join the Review Board",
       body: "Congratulations! You’ve been selected as an SL Composer to join the Review Board. Please check your email for invite details and next steps.",
-      metadata: { link: "/dashboard/review-board" },
+      metadata: { link: "/review-board" },
       channel: "inbox",
       target: { type: "custom", user_ids: [composer.id] }
     });

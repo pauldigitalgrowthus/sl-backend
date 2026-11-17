@@ -15,8 +15,10 @@ const educatorCourseProposalRoutes = require("./educator-course-proposal");
 const educatorQuizzesRoutes = require("./educator-course-quizzes");
 const educatorQuizAttemptsRoutes = require("./educator-quiz-attempts");
 const educatorCourseLearnRoutes = require("./educator-course-learn");
-
-
+const educatorCartRoutes = require("./educator-cart");
+const educatorCourseDraftsRoutes = require("./educator-course-drafts");
+const educatorCourseMasterRoutes = require("./educator-course-master");
+const educatorPaymentEnrollmentHistoryRoutes = require("./educator-payment-enrollment-history");
 
 // ================= EDUCATOR TOOLS =================
 // @route   /api/educator/tools
@@ -91,6 +93,16 @@ router.use("/review", educatorReviewRoutes);
 router.use("/enrollments", educatorEnrollmentsRoutes);
 
 
+// ================= CART =================
+// @route   /api/educator/cart
+// @desc    Add/remove paid courses to a cart, then checkout the
+//          whole cart in a single Stripe payment (multi-course).
+//          This is now the primary path for buying paid courses;
+//          see educator-cart.js for the full flow.
+// @access  Private (Student)
+router.use("/cart", educatorCartRoutes);
+
+
 // ================= COURSE PROGRESS =================
 // @route   /api/educator/progress
 // @desc    Lesson progress tracking & course completion
@@ -108,6 +120,22 @@ router.use("/progress", educatorProgressRoutes);
 // @access  Private (Enrolled Student)
 router.use("/learn", educatorCourseLearnRoutes);
 
+
+// ================= COURSE DRAFTS =================
+// @route   /api/educator/course-drafts
+// @desc    Save, update, fetch and delete course draft
+// @access  Private
+router.use("/course-drafts", educatorCourseDraftsRoutes);
+
+
+// ================= COURSE MASTER DATA =================
+// @route   /api/educator/areas-of-expertise, /api/educator/target-audience, /api/educator/tools
+// @desc    Master data management (areas-of-expertise, target-audience, tools)
+// @access  Public / Private (Admin)
+router.use("/course-master", educatorCourseMasterRoutes);
+
+// ...
+router.use("/payment-enrollment-history", educatorPaymentEnrollmentHistoryRoutes);
 
 // ================= EXPORT ROUTER =================
 module.exports = router;

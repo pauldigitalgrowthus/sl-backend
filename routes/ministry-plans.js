@@ -6,7 +6,356 @@ const { successResponse, errorResponse } = require('../utils/response');
 const { getMySQLConnection } = require('../config/mysql');
 // const PermissionService = require('../services/PermissionService');
 
+
 const router = express.Router();
+
+// =============================================================
+// 🗂️ In-memory job store for the "sync all plans' subscribers" bulk route.
+// Mirrors the pattern used in auth.js's sync-active-campaign-all —
+// runs in the background and is polled via a status route so it
+// never hits the server's global 120s request timeout.
+// Lives only in process memory (no DB change) and resets on restart.
+// =============================================================
+const acPlanSyncJobs = new Map();
+
+// =============================================================
+// 🏷️ ActiveCampaign Tag Helpers
+// =============================================================
+// Keep plans.ac_tag_id in sync with ActiveCampaign so future
+// updates/deletes don't rely on matching by name (names change, IDs don't).
+
+async function createActiveCampaignTag(tagName, description) {
+    try {
+        const createResponse = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags`, {
+            method: "POST",
+            headers: {
+                "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                tag: {
+                    tag: tagName,
+                    tagType: "contact",
+                    description,
+                },
+            }),
+        });
+
+        const createData = await createResponse.json();
+
+        if (createResponse.ok) {
+            return createData.tag;
+        }
+
+        console.error(`Failed to create AC tag "${tagName}"`, createData);
+        return null;
+    } catch (err) {
+        console.error(`Error creating AC tag "${tagName}":`, err.message);
+        return null;
+    }
+}
+
+async function updateActiveCampaignTag(tagId, tagName, description) {
+    if (!tagId) return null;
+    try {
+        const updateResponse = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags/${tagId}`, {
+            method: "PUT",
+            headers: {
+                "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                tag: {
+                    tag: tagName,
+                    tagType: "contact",
+                    description,
+                },
+            }),
+        });
+
+        const updateData = await updateResponse.json();
+
+        if (updateResponse.ok) {
+            return updateData.tag;
+        }
+
+        console.error(`Failed to update AC tag ${tagId}`, updateData);
+        return null;
+    } catch (err) {
+        console.error(`Error updating AC tag ${tagId}:`, err.message);
+        return null;
+    }
+}
+
+async function deleteActiveCampaignTag(tagId) {
+    if (!tagId) return false;
+    try {
+        const deleteResponse = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags/${tagId}`, {
+            method: "DELETE",
+            headers: {
+                "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                "Content-Type": "application/json",
+            },
+        });
+
+        // AC returns 200/204 on success; treat 404 as "already gone" (not an error)
+        if (!deleteResponse.ok && deleteResponse.status !== 404) {
+            console.error(`Failed to delete AC tag ${tagId}, status: ${deleteResponse.status}`);
+            return false;
+        }
+        return true;
+    } catch (err) {
+        console.error(`Error deleting AC tag ${tagId}:`, err.message);
+        return false;
+    }
+}
+
+// =============================================================
+// 👤 ActiveCampaign Contact Sync (for users subscribed to this plan)
+// =============================================================
+async function syncActiveCampaignContact({ email, firstName, lastName, phone }) {
+    try {
+        const syncResponse = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/contact/sync`, {
+            method: "POST",
+            headers: {
+                "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                contact: {
+                    email,
+                    firstName: firstName || "",
+                    lastName: lastName || "",
+                    ...(phone ? { phone } : {}),
+                },
+            }),
+        });
+
+        const syncData = await syncResponse.json();
+
+        if (syncResponse.ok) {
+            return syncData.contact;
+        }
+
+        console.error(`Failed to sync AC contact "${email}"`, syncData);
+        return null;
+    } catch (err) {
+        console.error(`Error syncing AC contact "${email}":`, err.message);
+        return null;
+    }
+}
+
+async function addTagToActiveCampaignContact(contactId, tagId) {
+    if (!contactId || !tagId) return false;
+    try {
+        const response = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/contactTags`, {
+            method: "POST",
+            headers: {
+                "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                contactTag: {
+                    contact: contactId,
+                    tag: tagId,
+                },
+            }),
+        });
+
+        // AC returns 422 if the tag is already applied to the contact — that's fine
+        if (response.ok || response.status === 422) {
+            return true;
+        }
+
+        const data = await response.json().catch(() => ({}));
+        console.error(`Failed to add tag ${tagId} to contact ${contactId}`, data);
+        return false;
+    } catch (err) {
+        console.error(`Error adding tag ${tagId} to contact ${contactId}:`, err.message);
+        return false;
+    }
+}
+
+// Resolve (or create + persist) a role/badge's AC tag ID — role_permissions table
+async function getOrCreateRoleTag(mysqlConnection, roleName) {
+    try {
+        const [rows] = await mysqlConnection.execute(
+            'SELECT id, ac_tag_id FROM role_permissions WHERE role_name = ?',
+            [roleName]
+        );
+
+        const roleRow = rows[0] || null;
+
+        if (roleRow?.ac_tag_id) {
+            return { id: roleRow.ac_tag_id };
+        }
+
+        const tag = await createActiveCampaignTag(roleName, `${roleName} role`);
+
+        if (tag && roleRow) {
+            await mysqlConnection.execute(
+                'UPDATE role_permissions SET ac_tag_id = ? WHERE id = ?',
+                [tag.id, roleRow.id]
+            );
+        }
+
+        return tag;
+    } catch (err) {
+        console.error(`Error resolving AC tag for role "${roleName}":`, err.message);
+        return null;
+    }
+}
+
+// Resolve (or create + persist) a plan's AC tag ID
+async function getOrCreatePlanTag(mysqlConnection, planName, planId) {
+    try {
+        const [rows] = await mysqlConnection.execute(
+            'SELECT ac_tag_id FROM plans WHERE id = ?',
+            [planId]
+        );
+
+        const existingTagId = rows[0]?.ac_tag_id;
+
+        if (existingTagId) {
+            return { id: existingTagId };
+        }
+
+        const tag = await createActiveCampaignTag(planName, `Plan: ${planName}`);
+
+        if (tag) {
+            await mysqlConnection.execute(
+                'UPDATE plans SET ac_tag_id = ? WHERE id = ?',
+                [tag.id, planId]
+            );
+        }
+
+        return tag;
+    } catch (err) {
+        console.error(`Error resolving AC tag for plan "${planName}":`, err.message);
+        return null;
+    }
+}
+
+// Full resync of ONE user (contact + all their current badge tags + plan tag).
+// Same logic used across the codebase (auth.js / roles.js) — duplicated here
+// so this route file doesn't need a cross-file import.
+async function syncUserToActiveCampaign(mysqlConnection, userId) {
+    const [users] = await mysqlConnection.execute(
+        `SELECT id, first_name, last_name, email, phone, badges,
+                current_plan_id, plan_status
+         FROM users WHERE id = ?`,
+        [userId]
+    );
+
+    if (!users.length) {
+        return { success: false, userId, error: 'User not found' };
+    }
+
+    const user = users[0];
+
+    let badges = [];
+    try {
+        badges = user.badges ? JSON.parse(user.badges) : [];
+    } catch {
+        badges = [];
+    }
+
+    // Never sync "Manager"/"Minister" badges to ActiveCampaign (internal-only)
+    const excludedBadgePattern = /manager|minister/i;
+    const syncableBadges = badges.filter((b) => b && !excludedBadgePattern.test(b));
+
+    let planName = null;
+    if (user.current_plan_id && user.plan_status === 'active') {
+        const [plans] = await mysqlConnection.execute(
+            'SELECT name FROM plans WHERE id = ? AND is_active = TRUE',
+            [user.current_plan_id]
+        );
+        if (plans.length) planName = plans[0].name;
+    }
+
+    const contact = await syncActiveCampaignContact({
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        phone: user.phone,
+    });
+
+    if (!contact) {
+        return { success: false, userId, email: user.email, error: 'Failed to sync contact to ActiveCampaign' };
+    }
+
+    const appliedTags = [];
+    const failedTags = [];
+
+    for (const badgeName of syncableBadges) {
+        const tag = await getOrCreateRoleTag(mysqlConnection, badgeName);
+        if (tag) {
+            const ok = await addTagToActiveCampaignContact(contact.id, tag.id);
+            (ok ? appliedTags : failedTags).push(badgeName);
+        } else {
+            failedTags.push(badgeName);
+        }
+    }
+
+    if (planName) {
+        const tag = await getOrCreatePlanTag(mysqlConnection, planName, user.current_plan_id);
+        if (tag) {
+            const ok = await addTagToActiveCampaignContact(contact.id, tag.id);
+            (ok ? appliedTags : failedTags).push(planName);
+        } else {
+            failedTags.push(planName);
+        }
+    }
+
+    return { success: true, userId: user.id, contactId: contact.id, email: user.email, appliedTags, failedTags };
+}
+
+// Re-sync every active user currently subscribed to this plan.
+// Runs sequentially in the background (fire-and-forget from the caller)
+// so a plan create/update/delete never blocks the actual API response.
+async function syncUsersForPlan(mysqlConnection, planId) {
+    try {
+        const [users] = await mysqlConnection.execute(
+            `SELECT id FROM users
+             WHERE is_active = 1 AND deleted_at IS NULL
+               AND current_plan_id = ? AND plan_status = 'active'`,
+            [planId]
+        );
+
+        if (!users.length) {
+            console.log(`ℹ️ [AC PLAN SYNC] No active subscribers on plan ${planId} — nothing to sync`);
+            return { total: 0, succeeded: 0, failed: 0 };
+        }
+
+        console.log(`🚀 [AC PLAN SYNC] Re-syncing ${users.length} user(s) on plan ${planId}...`);
+
+        let succeeded = 0;
+        let failed = 0;
+
+        for (const { id: userId } of users) {
+            try {
+                const result = await syncUserToActiveCampaign(mysqlConnection, userId);
+                result.success ? succeeded++ : failed++;
+            } catch (err) {
+                console.error(`❌ [AC PLAN SYNC] Error syncing user ${userId}:`, err.message);
+                failed++;
+            }
+        }
+
+        console.log(`✅ [AC PLAN SYNC] Done for plan ${planId}. Synced ${succeeded}/${users.length}, failed ${failed}.`);
+        return { total: users.length, succeeded, failed };
+    } catch (err) {
+        console.error(`❌ [AC PLAN SYNC] Failed to sync users for plan ${planId}:`, err.message);
+        return { total: 0, succeeded: 0, failed: 0, error: err.message };
+    }
+}
+
+// Fire-and-forget wrapper — call right before responding so a plan
+// create/update/delete never waits on ActiveCampaign.
+function triggerPlanUsersSync(mysqlConnection, planId, context = '') {
+    syncUsersForPlan(mysqlConnection, planId)
+        .catch((err) => console.error(`⚠️ [AC PLAN SYNC${context ? ':' + context : ''}] threw:`, err.message));
+}
 
 // Middleware to check if user is admin/sl_team
 const isAdmin = async (req, res, next) => {
@@ -418,6 +767,7 @@ router.get('/', async (req, res) => {
         description,
         price,
         billing_cycle,
+        ac_tag_id,
         created_at
       FROM plans 
       WHERE is_active = TRUE 
@@ -426,10 +776,101 @@ router.get('/', async (req, res) => {
         price ASC
     `);
 
-    successResponse(res, { plans }, 'Plans retrieved successfully');
+    const plansWithTags = await Promise.all(
+      plans.map(async (plan) => {
+        try {
+          let tag = null;
+
+          // ----------------------------------------
+          // If we already have the AC tag ID saved, fetch it directly
+          // ----------------------------------------
+          if (plan.ac_tag_id) {
+            const getResponse = await fetch(
+              `${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags/${plan.ac_tag_id}`,
+              {
+                headers: {
+                  "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                  "Content-Type": "application/json",
+                },
+              }
+            );
+
+            if (getResponse.ok) {
+              const getData = await getResponse.json();
+              tag = getData.tag || null;
+            }
+          }
+
+          // ----------------------------------------
+          // Fallback: search by name (legacy plans without ac_tag_id)
+          // ----------------------------------------
+          if (!tag) {
+            const searchResponse = await fetch(
+              `${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags?search=${encodeURIComponent(
+                plan.name
+              )}`,
+              {
+                headers: {
+                  "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                  "Content-Type": "application/json",
+                },
+              }
+            );
+
+            const searchData = await searchResponse.json();
+
+            if (
+              searchResponse.ok &&
+              Array.isArray(searchData.tags) &&
+              searchData.tags.length
+            ) {
+              tag = searchData.tags.find(
+                (t) => t.tag.toLowerCase() === plan.name.toLowerCase()
+              );
+            }
+          }
+
+          // ----------------------------------------
+          // Create tag if still not found
+          // ----------------------------------------
+          if (!tag) {
+            tag = await createActiveCampaignTag(plan.name, `Plan: ${plan.name}`);
+          }
+
+          // ----------------------------------------
+          // Persist the tag ID so future requests skip the search
+          // ----------------------------------------
+          if (tag && tag.id != plan.ac_tag_id) {
+            await mysqlConnection.execute(
+              "UPDATE plans SET ac_tag_id = ? WHERE id = ?",
+              [tag.id, plan.id]
+            );
+            plan.ac_tag_id = tag.id;
+          }
+
+          return {
+            ...plan,
+            activeCampaignTag: tag || null,
+          };
+        } catch (err) {
+          console.error(`Error processing plan ${plan.name}:`, err);
+
+          return {
+            ...plan,
+            activeCampaignTag: null,
+          };
+        }
+      })
+    );
+
+    return successResponse(
+      res,
+      { plans: plansWithTags },
+      "Plans retrieved successfully"
+    );
   } catch (error) {
-    console.error('Get plans error:', error);
-    errorResponse(res, 'Failed to retrieve plans', 500);
+    console.error("Get plans error:", error);
+    return errorResponse(res, "Failed to retrieve plans", 500);
   }
 });
 
@@ -723,11 +1164,31 @@ router.post('/admin/create', [
       VALUES (?, ?, ?, ?, ?, TRUE)
     `, [name, slug, description || null, price, billing_cycle]);
 
+    // 🏷️ Create matching ActiveCampaign tag & store its ID against this plan
+    try {
+      const activeCampaignTag = await createActiveCampaignTag(name, `Plan: ${name}`);
+
+      if (activeCampaignTag) {
+        await mysqlConnection.execute(
+          'UPDATE plans SET ac_tag_id = ? WHERE id = ?',
+          [activeCampaignTag.id, result.insertId]
+        );
+      }
+    } catch (acError) {
+      console.error('❌ Failed to create ActiveCampaign tag for plan:', acError.message);
+      // Don't fail the request, just log the error
+    }
+
     // ✅ Fetch the created plan
     const [newPlan] = await mysqlConnection.execute(
       'SELECT * FROM plans WHERE id = ?',
       [result.insertId]
     );
+
+    // 🔗 Re-sync (non-blocking) — a brand-new plan has no subscribers yet,
+    // but this keeps create/update/delete consistent and covers any edge
+    // case where users were pre-assigned this plan id in the same request batch.
+    triggerPlanUsersSync(mysqlConnection, result.insertId, 'plan-create');
 
     successResponse(res, {
       plan: newPlan[0]
@@ -849,11 +1310,35 @@ router.put('/admin/update/:id(\\d+)', [
       values
     );
 
+    // 🏷️ Keep the ActiveCampaign tag in sync if the plan was renamed
+    if (name !== undefined && name !== currentPlan.name) {
+      try {
+        if (currentPlan.ac_tag_id) {
+          await updateActiveCampaignTag(currentPlan.ac_tag_id, name, `Plan: ${name}`);
+        } else {
+          // No tag was ever linked — create one now and save its ID
+          const newTag = await createActiveCampaignTag(name, `Plan: ${name}`);
+          if (newTag) {
+            await mysqlConnection.execute(
+              'UPDATE plans SET ac_tag_id = ? WHERE id = ?',
+              [newTag.id, id]
+            );
+          }
+        }
+      } catch (acError) {
+        console.error('❌ Failed to sync ActiveCampaign tag on plan rename:', acError.message);
+        // Don't fail the request, just log the error
+      }
+    }
+
     // Return updated plan
     const [updatedPlan] = await mysqlConnection.execute(
       'SELECT * FROM plans WHERE id = ?',
       [id]
     );
+
+    // 🔗 Re-sync every active subscriber on this plan to ActiveCampaign (non-blocking)
+    triggerPlanUsersSync(mysqlConnection, id, 'plan-update');
 
     return successResponse(res, {
       plan: updatedPlan[0]
@@ -877,7 +1362,7 @@ router.delete('/admin/delete/:id(\\d+)', [auth, isAdmin], async (req, res) => {
   try {
     // ✅ Check if plan exists
     const [plans] = await pool.execute(
-      'SELECT id, name, is_active FROM plans WHERE id = ?',
+      'SELECT id, name, is_active, ac_tag_id FROM plans WHERE id = ?',
       [id]
     );
 
@@ -918,6 +1403,16 @@ router.delete('/admin/delete/:id(\\d+)', [auth, isAdmin], async (req, res) => {
 
         await conn.commit();
 
+        // 🏷️ Plan is permanently gone — remove its ActiveCampaign tag too
+        // (soft delete/deactivate on the other hand keeps the tag, since the
+        // plan could still be reactivated)
+        if (plan.ac_tag_id) {
+          const deleted = await deleteActiveCampaignTag(plan.ac_tag_id);
+          if (!deleted) {
+            console.error(`⚠️ Could not delete AC tag ${plan.ac_tag_id} for plan "${plan.name}" — continuing anyway`);
+          }
+        }
+
         return successResponse(
           res,
           { deletedId: id },
@@ -940,6 +1435,11 @@ router.delete('/admin/delete/:id(\\d+)', [auth, isAdmin], async (req, res) => {
       'UPDATE plans SET is_active = FALSE, updated_at = NOW() WHERE id = ?',
       [id]
     );
+
+    // 🔗 Re-sync any users still pointing at this plan (non-blocking) —
+    // refreshes their contact/badge tags; the plan tag itself won't be
+    // re-applied since the plan is now inactive.
+    triggerPlanUsersSync(pool, id, 'plan-deactivate');
 
     successResponse(
       res,
@@ -993,6 +1493,9 @@ router.put('/admin/activate/:id(\\d+)', [auth, isAdmin], async (req, res) => {
 
     // ✅ Activate plan
     await pool.execute('UPDATE plans SET is_active = TRUE, updated_at = NOW() WHERE id = ?', [id]);
+
+    // 🔗 Re-sync subscribers so the plan tag is applied again (non-blocking)
+    triggerPlanUsersSync(pool, id, 'plan-activate');
 
     successResponse(res, { activatedId: id }, `Plan "${plan.name}" activated successfully`);
 
@@ -2284,5 +2787,133 @@ router.get('/permissions', async (req, res) => {
 });
 
 
+
+// =============================================================
+// 🔗 MANUAL SYNC — Re-sync every subscriber of a plan to AC
+// =============================================================
+// @route   POST /api/plans/admin/:id(\d+)/sync-users
+// @desc    Manually re-sync ActiveCampaign contact + tags for every
+//          active user currently subscribed to this plan. Useful
+//          right after bulk plan assignments, or just to force a
+//          refresh without waiting for a plan update.
+// @access  Private (Admin only)
+router.post('/admin/:id(\\d+)/sync-users', [auth, isAdmin], async (req, res) => {
+  try {
+    const { id } = req.params;
+    const pool = getMySQLConnection();
+
+    const [plans] = await pool.execute('SELECT id, name FROM plans WHERE id = ?', [id]);
+
+    if (!plans.length) {
+      return errorResponse(res, 'Plan not found', 404);
+    }
+
+    // Respond immediately, then sync in the background — a plan with a lot
+    // of subscribers could otherwise exceed the server's 120s timeout.
+    successResponse(
+      res,
+      { plan_id: id, plan_name: plans[0].name },
+      `Sync started for subscribers of plan "${plans[0].name}". Check server logs for progress.`,
+      202
+    );
+
+    triggerPlanUsersSync(pool, id, 'manual-sync-users');
+  } catch (err) {
+    console.error('❌ Sync users for plan error:', err);
+    return errorResponse(res, 'Failed to sync users for this plan');
+  }
+});
+
+// =============================================================
+// 🔗 BULK SYNC — Re-sync EVERY plan's subscribers to ActiveCampaign
+// =============================================================
+// @route   POST /api/plans/admin/sync-active-campaign-all
+// @desc    Goes through every plan and re-syncs every active subscriber
+//          on it. Runs as a BACKGROUND JOB (same pattern as auth.js's
+//          user-level bulk sync) — this responds immediately with a
+//          jobId since a full sweep across all plans can easily exceed
+//          the server's 120s timeout. Poll progress with:
+//          GET /api/plans/admin/sync-active-campaign-all/status/:jobId
+//          Optional body: { onlyActivePlans: true } → only currently
+//          active plans (default: true)
+// @access  Private (Admin only)
+router.post('/admin/sync-active-campaign-all', [auth, isAdmin], async (req, res) => {
+  try {
+    const pool = getMySQLConnection();
+    const onlyActivePlans = req.body?.onlyActivePlans !== false; // default true
+
+    const [plans] = await pool.execute(
+      onlyActivePlans
+        ? 'SELECT id, name FROM plans WHERE is_active = TRUE'
+        : 'SELECT id, name FROM plans'
+    );
+
+    const jobId = `plan-ac-sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+    const job = {
+      jobId,
+      status: 'running', // 'running' | 'completed'
+      totalPlans: plans.length,
+      processedPlans: 0,
+      totalUsersSynced: 0,
+      totalUsersFailed: 0,
+      startedAt: new Date().toISOString(),
+      finishedAt: null,
+      perPlan: [],
+    };
+    acPlanSyncJobs.set(jobId, job);
+
+    // 🚀 Respond immediately — the sync itself runs after this
+    successResponse(
+      res,
+      {
+        jobId,
+        totalPlans: job.totalPlans,
+        statusUrl: `/api/plans/admin/sync-active-campaign-all/status/${jobId}`,
+      },
+      `Bulk plan sync started for ${job.totalPlans} plan(s). Poll the statusUrl for progress.`,
+      202
+    );
+
+    // 🔄 Run in the background (sequential, one plan at a time)
+    setImmediate(async () => {
+      console.log(`🚀 [BULK PLAN AC SYNC:${jobId}] Starting sync for ${plans.length} plan(s)...`);
+
+      for (const { id: planId, name: planName } of plans) {
+        try {
+          const result = await syncUsersForPlan(pool, planId);
+          job.processedPlans += 1;
+          job.totalUsersSynced += result.succeeded;
+          job.totalUsersFailed += result.failed;
+          job.perPlan.push({ plan_id: planId, plan_name: planName, ...result });
+        } catch (err) {
+          console.error(`❌ [BULK PLAN AC SYNC:${jobId}] Error syncing plan "${planName}":`, err.message);
+          job.processedPlans += 1;
+          job.perPlan.push({ plan_id: planId, plan_name: planName, total: 0, succeeded: 0, failed: 0, error: err.message });
+        }
+      }
+
+      job.status = 'completed';
+      job.finishedAt = new Date().toISOString();
+      console.log(`✅ [BULK PLAN AC SYNC:${jobId}] Done. ${job.totalUsersSynced} user(s) synced, ${job.totalUsersFailed} failed, across ${job.totalPlans} plan(s).`);
+    });
+  } catch (err) {
+    console.error('❌ Bulk plan sync error:', err);
+    return errorResponse(res, 'Failed to start bulk plan sync to ActiveCampaign');
+  }
+});
+
+// @route   GET /api/plans/admin/sync-active-campaign-all/status/:jobId
+// @desc    Check progress/result of a bulk plan-sync job started above
+// @access  Private (Admin only)
+router.get('/admin/sync-active-campaign-all/status/:jobId', [auth, isAdmin], async (req, res) => {
+  const job = acPlanSyncJobs.get(req.params.jobId);
+
+  if (!job) {
+    return errorResponse(res, 'Job not found (it may have finished and the server since restarted)', 404);
+  }
+
+  return successResponse(res, job, 'Bulk plan sync job status');
+});
 
 module.exports = router;

@@ -5,7 +5,7 @@ const helmet = require('helmet');
 const morgan = require('morgan');
 const timeout = require('express-timeout-handler');
 const path = require('path');
-const fs = require('fs'); 
+const fs = require('fs');
 const { auth } = require('./middleware/auth');
 const globalActivityLogger = require('./middleware/globalActivityLogger');
 require('dotenv').config();
@@ -15,6 +15,7 @@ const XLSX = require("xlsx");
 
 // Import database connections
 const { connectMySQL } = require('./config/mysql');
+const { initSubscriptionCronJobs } = require('./utils/subscriptionCronJobs');
 
 // Import routes
 const authRoutes = require('./routes/auth');
@@ -50,8 +51,14 @@ const activityHistoryRoutes = require('./routes/activity-history');
 const bulkUser = require("./routes/bulk-user");
 const couponRoutes = require("./routes/coupon.routes");
 const hymnalMusicLibraryRoutes = require('./routes/hymnal-music-library');
-const documentRoutes = require("./routes/Document-Portal/document")
-const educatorRoutes = require("./routes/Educator-Portal/main")
+const documentRoutes = require("./routes/Document-Portal/document");
+const educatorRoutes = require("./routes/Educator-Portal/main");
+const royaltyRoutes = require("./routes/Royalty-Portal/main");
+const quickbooksRoutes = require("./routes/quickbooks");
+const composerEarningsRoutes = require('./routes/composer-earnings');
+const communityPortalRoutes = require('./routes/community-portal/main');
+const { initSocket } = require('./routes/community-portal/socket');
+const http = require('http');
 
 const { successResponse, errorResponse } = require('./utils/response');
 
@@ -70,7 +77,7 @@ app.use('/api/payments/webhook', express.raw({ type: 'application/json' }));
 // app.use('/api/user-music-library/webhook',express.raw({ type: 'application/json' }))
 app.use(express.json());
 app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-app.use(express.static("public"));
+// app.use(express.static("public"));
 
 // Timeout configuration
 const timeoutOptions = {
@@ -92,15 +99,39 @@ const timeoutOptions = {
 // Use timeout middleware BEFORE routes (very important!)
 app.use(timeout.handler(timeoutOptions));
 
-// Health check endpoint
-app.get('/health', (req, res) => {
-  res.status(200).json({
-    status: 'OK',
-    message: 'Server is running',
-    timestamp: new Date().toISOString(),
-    environment: process.env.NODE_ENV,
-    timeout: '120 seconds'
-  });
+// Health check & System Availability endpoint
+app.get('/health', async (req, res) => {
+  try {
+    let isMaintenance = false;
+    try {
+      const mysql = getMySQLConnection();
+      if (mysql) {
+        const [rows] = await mysql.execute(
+          "SELECT config_value FROM system_configurations WHERE config_key = 'site_maintenance_mode' LIMIT 1"
+        );
+        if (rows && rows.length > 0) {
+          isMaintenance = rows[0].config_value === 'true';
+        }
+      }
+    } catch (dbErr) {
+      // Fail-open: if DB check fails, default maintenance to false
+      console.warn('Could not read system_configurations for /health, defaulting to false:', dbErr?.message);
+    }
+
+    if (isMaintenance) {
+      return res.status(503).json({
+        status: 'Service Unavailable'
+      });
+    }
+
+    res.status(200).json({
+      status: 'OK'
+    });
+  } catch (error) {
+    res.status(200).json({
+      status: 'OK'
+    });
+  }
 });
 
 // 🎯 CONDITIONAL AUTH MIDDLEWARE - Yeh auth check karega but fail nahi karega
@@ -194,7 +225,7 @@ app.use("/api/activity-history", require("./routes/activity-history"));
 
 // API routes
 
-app.use('/api',documentRoutes);
+app.use('/api', documentRoutes);
 
 app.use('/api/auth', authRoutes);
 app.use('/api/subscriptions', subscriptionRoutes);
@@ -226,6 +257,47 @@ app.use('/api/bulk-users', bulkUser)
 app.use('/api/coupons', couponRoutes);
 app.use('/api/hymnal-music', hymnalMusicLibraryRoutes);
 app.use('/api/educator', educatorRoutes);
+app.use('/api/royalty', royaltyRoutes);
+app.use('/api/quickbooks', quickbooksRoutes);
+app.use('/api/community-portal', communityPortalRoutes);
+app.use('/api/composer-earnings', composerEarningsRoutes);
+
+// System Availability / Maintenance Management Routes
+app.get('/api/admin/system/maintenance', auth, async (req, res) => {
+  try {
+    if (!['admin', 'superadmin'].includes(req.user?.user_type)) {
+      return errorResponse(res, 'Access denied. Administrator privileges required.', 403);
+    }
+    const mysql = getMySQLConnection();
+    const [rows] = await mysql.execute(
+      "SELECT config_value, updated_at FROM system_configurations WHERE config_key = 'site_maintenance_mode' LIMIT 1"
+    );
+    const isMaintenance = rows && rows.length > 0 ? rows[0].config_value === 'true' : false;
+    return successResponse(res, { maintenance: isMaintenance, updatedAt: rows?.[0]?.updated_at });
+  } catch (err) {
+    return errorResponse(res, err.message, 500);
+  }
+});
+
+app.put('/api/admin/system/maintenance', auth, async (req, res) => {
+  try {
+    if (req.user?.user_type !== 'superadmin') {
+      return errorResponse(res, 'Access denied. Superadmin privileges required.', 403);
+    }
+    const { maintenance } = req.body;
+    const value = (maintenance === true || maintenance === 'true' || maintenance === 1 || maintenance === '1') ? 'true' : 'false';
+    const mysql = getMySQLConnection();
+    await mysql.execute(
+      `INSERT INTO system_configurations (config_key, config_value, description)
+       VALUES ('site_maintenance_mode', ?, 'Controls global platform maintenance mode')
+       ON DUPLICATE KEY UPDATE config_value = VALUES(config_value), updated_at = NOW()`,
+      [value]
+    );
+    return successResponse(res, { maintenance: value === 'true' }, `Maintenance mode turned ${value === 'true' ? 'ON' : 'OFF'}`);
+  } catch (err) {
+    return errorResponse(res, err.message, 500);
+  }
+});
 
 /** ========================  Global Routes Start   ======================== */
 // @route GET /one-license-excel
@@ -258,21 +330,21 @@ app.get('/one-license-excel', auth, async (req, res) => {
     );
 
     const MASS_SETTING_PARTS = [
-      { id: "penitential_act_i",          name: "Penitential Act I",          textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "penitential_act_ii",         name: "Penitential Act II",         textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "kyrie",                      name: "Kyrie",                      textCopyright: "English translation of Kyrie 1988, ELLC." },
-      { id: "lord_have_mercy",            name: "Lord, Have Mercy",           textCopyright: "English translation of Lord, Have Mercy 1988, ELLC." },
-      { id: "gloria",                     name: "Gloria",                     textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "gospel_acclamation",         name: "Gospel Acclamation",         textCopyright: "The English translation of the Alleluia Verse from Lectionary for Mass 1969, 1981, 1997, ICEL." },
-      { id: "lenten_gospel_acclamation",  name: "Lenten Gospel Acclamation",  textCopyright: "The English translation of the Lenten Gospel Acclamation from Lectionary for Mass 1969, 1981, 1997, ICEL." },
-      { id: "prayers_of_the_faithful",    name: "Prayers of the Faithful",    textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "holy",                       name: "Holy",                       textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "memorial_acclamation_a",     name: "Memorial Acclamation A",     textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "memorial_acclamation_b",     name: "Memorial Acclamation B",     textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "memorial_acclamation_c",     name: "Memorial Acclamation C",     textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "doxology_and_great_amen",    name: "Doxology and Great Amen",    textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "lords_prayer",               name: "The Lord's Prayer",          textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "lamb_of_god",                name: "Lamb of God",                textCopyright: "English translation of Lamb of God 1988, ELLC." }
+      { id: "penitential_act_i", name: "Penitential Act I", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "penitential_act_ii", name: "Penitential Act II", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "kyrie", name: "Kyrie", textCopyright: "English translation of Kyrie 1988, ELLC." },
+      { id: "lord_have_mercy", name: "Lord, Have Mercy", textCopyright: "English translation of Lord, Have Mercy 1988, ELLC." },
+      { id: "gloria", name: "Gloria", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "gospel_acclamation", name: "Gospel Acclamation", textCopyright: "The English translation of the Alleluia Verse from Lectionary for Mass 1969, 1981, 1997, ICEL." },
+      { id: "lenten_gospel_acclamation", name: "Lenten Gospel Acclamation", textCopyright: "The English translation of the Lenten Gospel Acclamation from Lectionary for Mass 1969, 1981, 1997, ICEL." },
+      { id: "prayers_of_the_faithful", name: "Prayers of the Faithful", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "holy", name: "Holy", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "memorial_acclamation_a", name: "Memorial Acclamation A", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "memorial_acclamation_b", name: "Memorial Acclamation B", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "memorial_acclamation_c", name: "Memorial Acclamation C", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "doxology_and_great_amen", name: "Doxology and Great Amen", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "lords_prayer", name: "The Lord's Prayer", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "lamb_of_god", name: "Lamb of God", textCopyright: "English translation of Lamb of God 1988, ELLC." }
     ];
 
     const buildRows = (pub) => {
@@ -287,9 +359,7 @@ app.get('/one-license-excel', auth, async (req, res) => {
         artists = [];
       }
 
-      // ── FIX: Parse copyright year — supports both array and object format ─
-      // Array format:  [{"year":2017,"name":"Ephrem"}]
-      // Object format: {"year":2017}
+      // ── Parse copyright year — supports both array and object format ─────
       let copyrightYear = "";
       try {
         if (pub.composition_copyrights) {
@@ -298,11 +368,7 @@ app.get('/one-license-excel', auth, async (req, res) => {
             : pub.composition_copyrights;
 
           if (Array.isArray(cp)) {
-            // Extract year from each entry and join (e.g. "2017, 2020")
-            copyrightYear = cp
-              .map(c => c.year)
-              .filter(Boolean)
-              .join(", ");
+            copyrightYear = cp.map(c => c.year).filter(Boolean).join(", ");
           } else if (cp && typeof cp === "object") {
             copyrightYear = cp.year || "";
           }
@@ -311,7 +377,7 @@ app.get('/one-license-excel', auth, async (req, res) => {
         copyrightYear = "";
       }
 
-      // ── FIX: Parse language — supports both array and JSON-string formats ─
+      // ── Parse language — supports both array and JSON-string formats ─────
       let parsedLanguage = "";
       try {
         let lang = pub.language;
@@ -320,7 +386,6 @@ app.get('/one-license-excel', auth, async (req, res) => {
         }
         parsedLanguage = Array.isArray(lang) ? lang.join(", ") : lang || "";
       } catch (e) {
-        // If JSON.parse fails just use the raw string value
         parsedLanguage = pub.language || "";
       }
 
@@ -328,49 +393,29 @@ app.get('/one-license-excel', auth, async (req, res) => {
       const baseRow = () => {
         const row = {};
 
-        row["Unique ID"]      = pub.unique_id || "";
-        // Title & Text Details are overwritten below for mass-setting entries
-        row["Title"]          = pub.composition_title || "";
-        row["Text Details"]   = pub.text_copyright_notice || "";
-
-        // FIX: first_line_of_composition correctly mapped
-        row["First line"]     = pub.first_line_of_composition || "";
-
-        // FIX: year extracted from JSON array/object
+        row["Unique ID"] = pub.unique_id || "";
+        row["Title"] = pub.composition_title || "";
+        row["Text Details"] = pub.text_copyright_notice || "";
+        row["First line"] = pub.first_line_of_composition || "";
         row["Copyright Year"] = copyrightYear;
-
-        row["Song Type"]      = pub.song_type || "";
-
-        // FIX: language array joined to comma-separated string
-        row["Language"]       = parsedLanguage;
-
-        row["Meter"]          = pub.meter || "";
-        row["Season"]         = pub.season || "";
-        row["Tune"]           = pub.tune || "";
-        row["Psalm Number"]   = pub.psalm_number || "";
-        row["General Details"]= pub.general_details || "";
-
-        row["Tune Details"]         = pub.tune_copyright_notice || "";
+        row["Song Type"] = pub.song_type || "";
+        row["Language"] = parsedLanguage;
+        row["Meter"] = pub.meter || "";
+        row["Season"] = pub.season || "";
+        row["Tune"] = pub.tune || "";
+        row["Psalm Number"] = pub.psalm_number || "";
+        row["General Details"] = pub.general_details || "";
+        row["Tune Details"] = pub.tune_copyright_notice || "";
         row["Country Restrictions"] = pub.country_restrictions || "";
-        row["Is Public Domain"]     = pub.is_public_domain           ? "Yes" : "No";
-        row["Can Be Reprinted"]     = pub.can_be_reprinted           ? "Yes" : "No";
-        row["Can Be Podcast/Streamed"]         = pub.can_be_podcast_streamed        ? "Yes" : "No";
-        row["Can Make Commercial Recording"]   = pub.can_make_commercial_recording  ? "Yes" : "No";
+        row["Is Public Domain"] = pub.is_public_domain ? "Yes" : "No";
+        row["Can Be Reprinted"] = pub.can_be_reprinted ? "Yes" : "No";
+        row["Can Be Podcast/Streamed"] = pub.can_be_podcast_streamed ? "Yes" : "No";
+        row["Can Make Commercial Recording"] = pub.can_make_commercial_recording ? "Yes" : "No";
         row["Can Make Non-commercial Recording"] = pub.can_make_non_commercial_recording ? "Yes" : "No";
 
-        for (let i = 0; i < 4; i++) {
-          const a = artists[i] || {};
-
-          row[`Artist${i + 1} Title`]      = a.title      || "";
-          row[`Artist${i + 1} First name`] = a.first_name || "";
-
-          let lastSuffix = a.last_name || "";
-          if (a.suffix) lastSuffix += ` | ${a.suffix}`;
-          row[`Artist${i + 1} Last | Artist${i + 1} Suffix`] = lastSuffix;
-
-          row[`Artist${i + 1} Role`]       = a.role || "";
-          row[`Artist${i + 1} Royalty Per`]= a.royalty_percentage ?? a.royalty_per ?? "";
-        }
+        // Artist columns are filled in dynamically after all rows are built
+        // (see maxArtists / post-processing block below), same as export-music.
+        row._artists = artists;
 
         return row;
       };
@@ -390,45 +435,75 @@ app.get('/one-license-excel', auth, async (req, res) => {
 
       if (Array.isArray(massParts) && massParts.length > 0) {
         return massParts.map((id) => {
-          const def    = MASS_SETTING_PARTS.find((p) => p.id === id);
-          const row    = baseRow();
+          const def = MASS_SETTING_PARTS.find((p) => p.id === id);
+          const row = baseRow();
           const titleBase = pub.composition_title || "";
-          const partName  = def ? def.name : id;
-          row["Title"]        = titleBase && partName ? `${titleBase} - ${partName}` : titleBase || partName || "";
+          const partName = def ? def.name : id;
+          row["Title"] = titleBase && partName ? `${titleBase} - ${partName}` : titleBase || partName || "";
           row["Text Details"] = (def && def.textCopyright) || pub.text_copyright_notice || "";
           return row;
         });
       }
 
       // ── Single-row publication ────────────────────────────────────────────
-      const singleRow        = baseRow();
-      singleRow["Title"]       = pub.composition_title || "";
-      singleRow["Text Details"]= pub.text_copyright_notice || "";
+      const singleRow = baseRow();
+      singleRow["Title"] = pub.composition_title || "";
+      singleRow["Text Details"] = pub.text_copyright_notice || "";
       return [singleRow];
     };
 
     const formattedRows = Array.isArray(rows) ? rows.flatMap(buildRows) : [];
 
+    // ── Determine the maximum number of artists across all publications ────
+    let maxArtists = 4; // Start with at least 4 default columns as fallback
+    formattedRows.forEach((r) => {
+      if (r._artists && r._artists.length > maxArtists) {
+        maxArtists = r._artists.length;
+      }
+    });
+
+    // ── Populate the artist columns dynamically for each row ───────────────
+    formattedRows.forEach((row) => {
+      const rowArtists = row._artists || [];
+      for (let i = 0; i < maxArtists; i++) {
+        const a = rowArtists[i] || {};
+        const firstName = a.firstName || a.first_name || "";
+        const lastName = a.lastName || a.last_name || "";
+        const suffix = a.suffix || "";
+        const role = a.role || "";
+        const royaltyPer = a.royaltyPercent ?? a.royalty_percentage ?? a.royalty_per ?? "";
+
+        row[`Artist${i + 1} First name`] = firstName;
+
+        let lastSuffix = lastName;
+        if (suffix) lastSuffix += ` | ${suffix}`;
+        row[`Artist${i + 1} Last name`] = lastSuffix;
+
+        row[`Artist${i + 1} Role`] = role;
+        row[`Artist${i + 1} Royalty Per`] = royaltyPer;
+      }
+      delete row._artists; // clean up temporary property
+    });
+
     // Column order fallback if no rows
     const columnOrder = formattedRows.length > 0
       ? Object.keys(formattedRows[0])
       : [
-          'Unique ID', 'Title', 'First line', 'Copyright Year', 'Song Type',
-          'Language', 'Meter', 'Season', 'Tune', 'Psalm Number', 'General Details',
-          'Text Details', 'Tune Details', 'Country Restrictions',
-          'Is Public Domain', 'Can Be Reprinted', 'Can Be Podcast/Streamed',
-          'Can Make Commercial Recording', 'Can Make Non-commercial Recording',
-          ...Array.from({ length: 4 }).flatMap((_, i) => {
-            const n = i + 1;
-            return [
-              `Artist${n} Title`,
-              `Artist${n} First name`,
-              `Artist${n} Last | Artist${n} Suffix`,
-              `Artist${n} Role`,
-              `Artist${n} Royalty Per`
-            ];
-          })
-        ];
+        'Unique ID', 'Title', 'First line', 'Copyright Year', 'Song Type',
+        'Language', 'Meter', 'Season', 'Tune', 'Psalm Number', 'General Details',
+        'Text Details', 'Tune Details', 'Country Restrictions',
+        'Is Public Domain', 'Can Be Reprinted', 'Can Be Podcast/Streamed',
+        'Can Make Commercial Recording', 'Can Make Non-commercial Recording',
+        ...Array.from({ length: maxArtists }).flatMap((_, i) => {
+          const n = i + 1;
+          return [
+            `Artist${n} First name`,
+            `Artist${n} Last name`,
+            `Artist${n} Role`,
+            `Artist${n} Royalty Per`
+          ];
+        })
+      ];
 
     // Ensure every row has all columns (no missing keys)
     const orderedData = formattedRows.map(r => {
@@ -442,7 +517,7 @@ app.get('/one-license-excel', auth, async (req, res) => {
     worksheet['!cols'] = columnOrder.map((col) => {
       if (col.includes("Title") || col.includes("Details") || col.includes("General")) return { wch: 30 };
       if (col.includes("First line")) return { wch: 40 };
-      if (col.includes("First name") || col.includes("Last"))                          return { wch: 20 };
+      if (col.includes("First name") || col.includes("Last")) return { wch: 20 };
       return { wch: 15 };
     });
 
@@ -450,7 +525,7 @@ app.get('/one-license-excel', auth, async (req, res) => {
     XLSX.utils.book_append_sheet(workbook, worksheet, "OneLicense Info");
 
     // Buffer-only export — immediate download
-    const buffer   = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
     const filename = `one_license_published_${Date.now()}.xlsx`;
 
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
@@ -494,21 +569,21 @@ app.get('/export-music', auth, async (req, res) => {
     );
 
     const MASS_SETTING_PARTS = [
-      { id: "penitential_act_i",         name: "Penitential Act I",         textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "penitential_act_ii",        name: "Penitential Act II",        textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "kyrie",                     name: "Kyrie",                     textCopyright: "English translation of Kyrie 1988, ELLC." },
-      { id: "lord_have_mercy",           name: "Lord, Have Mercy",          textCopyright: "English translation of Lord, Have Mercy 1988, ELLC." },
-      { id: "gloria",                    name: "Gloria",                    textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "gospel_acclamation",        name: "Gospel Acclamation",        textCopyright: "The English translation of the Alleluia Verse from Lectionary for Mass 1969, 1981, 1997, ICEL." },
+      { id: "penitential_act_i", name: "Penitential Act I", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "penitential_act_ii", name: "Penitential Act II", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "kyrie", name: "Kyrie", textCopyright: "English translation of Kyrie 1988, ELLC." },
+      { id: "lord_have_mercy", name: "Lord, Have Mercy", textCopyright: "English translation of Lord, Have Mercy 1988, ELLC." },
+      { id: "gloria", name: "Gloria", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "gospel_acclamation", name: "Gospel Acclamation", textCopyright: "The English translation of the Alleluia Verse from Lectionary for Mass 1969, 1981, 1997, ICEL." },
       { id: "lenten_gospel_acclamation", name: "Lenten Gospel Acclamation", textCopyright: "The English translation of the Lenten Gospel Acclamation from Lectionary for Mass 1969, 1981, 1997, ICEL." },
-      { id: "prayers_of_the_faithful",   name: "Prayers of the Faithful",   textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "holy",                      name: "Holy",                      textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "memorial_acclamation_a",    name: "Memorial Acclamation A",    textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "memorial_acclamation_b",    name: "Memorial Acclamation B",    textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "memorial_acclamation_c",    name: "Memorial Acclamation C",    textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "doxology_and_great_amen",   name: "Doxology and Great Amen",   textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "lords_prayer",              name: "The Lord's Prayer",         textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
-      { id: "lamb_of_god",               name: "Lamb of God",               textCopyright: "English translation of Lamb of God 1988, ELLC." }
+      { id: "prayers_of_the_faithful", name: "Prayers of the Faithful", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "holy", name: "Holy", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "memorial_acclamation_a", name: "Memorial Acclamation A", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "memorial_acclamation_b", name: "Memorial Acclamation B", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "memorial_acclamation_c", name: "Memorial Acclamation C", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "doxology_and_great_amen", name: "Doxology and Great Amen", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "lords_prayer", name: "The Lord's Prayer", textCopyright: "Text excerpts from the English translation of the Roman Missal 2010, ICEL." },
+      { id: "lamb_of_god", name: "Lamb of God", textCopyright: "English translation of Lamb of God 1988, ELLC." }
     ];
 
     const buildRows = (pub) => {
@@ -560,57 +635,181 @@ app.get('/export-music', auth, async (req, res) => {
         parsedLanguage = pub.language || "";
       }
 
+      // ── Parse additional composition data fields safely ────────────────────
+      let parsedVocalParts = "";
+      try {
+        if (pub.vocal_parts) {
+          const vp = typeof pub.vocal_parts === "string" ? JSON.parse(pub.vocal_parts) : pub.vocal_parts;
+          parsedVocalParts = Array.isArray(vp) ? vp.join(", ") : vp || "";
+        }
+      } catch (e) {
+        parsedVocalParts = pub.vocal_parts || "";
+      }
+
+      let parsedInstrumentation = "";
+      try {
+        if (pub.instrumentation) {
+          const inst = typeof pub.instrumentation === "string" ? JSON.parse(pub.instrumentation) : pub.instrumentation;
+          parsedInstrumentation = Array.isArray(inst) ? inst.join(", ") : inst || "";
+        }
+      } catch (e) {
+        parsedInstrumentation = pub.instrumentation || "";
+      }
+
+      let parsedFeast = "";
+      try {
+        if (pub.feast) {
+          const f = typeof pub.feast === "string" ? JSON.parse(pub.feast) : pub.feast;
+          const extractFeast = (val) => {
+            if (val === null || val === undefined) return [];
+            if (typeof val === "string") return [val];
+            if (typeof val === "number" || typeof val === "boolean") return [String(val)];
+            if (Array.isArray(val)) return val.flatMap(extractFeast);
+            if (typeof val === "object") return Object.values(val).flatMap(extractFeast);
+            return [];
+          };
+          parsedFeast = [...new Set(extractFeast(f))].join(", ");
+        }
+      } catch (e) {
+        parsedFeast = pub.feast || "";
+      }
+
+      let parsedTheme = "";
+      try {
+        if (pub.theme) {
+          const t = typeof pub.theme === "string" ? JSON.parse(pub.theme) : pub.theme;
+          parsedTheme = Array.isArray(t) ? t.join(", ") : t || "";
+        }
+      } catch (e) {
+        parsedTheme = pub.theme || "";
+      }
+
+      let parsedPartOfMass = "";
+      let entranceCommunionAntiphon = "";
+      let liturgicalDaySequence = [];
+      try {
+        if (pub.partOfMass) {
+          const pom = typeof pub.partOfMass === "string" ? JSON.parse(pub.partOfMass) : pub.partOfMass;
+          if (Array.isArray(pom)) {
+            parsedPartOfMass = pom.join(", ");
+            entranceCommunionAntiphon = pom.filter(p => p && p.includes("Antiphon")).join(", ");
+            if (pom.includes("Sequence")) {
+              liturgicalDaySequence.push("Sequence");
+            }
+          } else {
+            parsedPartOfMass = pom || "";
+            if (pom && pom.includes("Antiphon")) {
+              entranceCommunionAntiphon = pom;
+            }
+            if (pom === "Sequence") {
+              liturgicalDaySequence.push("Sequence");
+            }
+          }
+        }
+      } catch (e) {
+        parsedPartOfMass = pub.partOfMass || "";
+      }
+
+      try {
+        if (pub.feast) {
+          const f = typeof pub.feast === "string" ? JSON.parse(pub.feast) : pub.feast;
+          const extractFeast = (val) => {
+            if (val === null || val === undefined) return [];
+            if (typeof val === "string") return [val];
+            if (typeof val === "number" || typeof val === "boolean") return [String(val)];
+            if (Array.isArray(val)) return val.flatMap(extractFeast);
+            if (typeof val === "object") return Object.values(val).flatMap(extractFeast);
+            return [];
+          };
+          const allFeastStrings = extractFeast(f);
+          const targetDays = ["Easter Sunday", "Pentecost Sunday", "Corpus Christi", "Easter", "Pentecost"];
+          allFeastStrings.forEach(str => {
+            targetDays.forEach(ld => {
+              if (str.toLowerCase().includes(ld.toLowerCase())) {
+                liturgicalDaySequence.push(str);
+              }
+            });
+          });
+        }
+      } catch (e) { }
+      const parsedLiturgicalDaySequence = [...new Set(liturgicalDaySequence)].join(", ");
+
+      let formattedPublishedAt = "";
+      if (pub.published_at) {
+        try {
+          const d = new Date(pub.published_at);
+          if (!isNaN(d.getTime())) {
+            formattedPublishedAt = d.toISOString().substring(0, 10);
+          }
+        } catch (e) { }
+      }
+
+      let parsedFilesBuckets = "";
+      try {
+        if (pub.music_files) {
+          const files = typeof pub.music_files === "string" ? JSON.parse(pub.music_files) : pub.music_files;
+          if (Array.isArray(files)) {
+            parsedFilesBuckets = files.map(f => f.fileUrl || f.fileName || "").filter(Boolean).join(", ");
+          }
+        }
+      } catch (e) { }
+
       // ── Base row builder (one row per publication / per mass-part) ────────
       const baseRow = () => {
         const row = {};
 
-        row["Music ID"]       = pub.id || "";
+        row["Music ID"] = pub.id || "";
         // ONE LICENSE ID: only populate if includeInOneLicense is true
         row["ONE LICENSE ID"] = pub.includeInOneLicense ? (pub.unique_id || "") : "";
 
         // Title & Text Details are overwritten below for mass-setting entries
-        row["Title"]          = pub.composition_title || "";
-        row["Text Details"]   = pub.text_copyright_notice || "";
+        row["Title"] = pub.composition_title || "";
+        row["Text Details"] = pub.text_copyright_notice || "";
 
         // FIX: first_line_of_composition correctly mapped
-        row["First line"]     = pub.first_line_of_composition || "";
+        row["First line"] = pub.first_line_of_composition || "";
 
         // FIX: year extracted from JSON array/object
         row["Copyright Year"] = copyrightYear;
 
-        row["Song Type"]      = pub.song_type || "";
+        row["Song Type"] = pub.song_type || "";
 
         // FIX: language array joined to comma-separated string
-        row["Language"]       = parsedLanguage;
+        row["Language"] = parsedLanguage;
 
-        row["Meter"]          = pub.meter || "";
-        row["Season"]         = pub.season || "";
-        row["Tune"]           = pub.tune || "";
-        row["Psalm Number"]   = pub.psalm_number || "";
-        row["General Details"]= pub.general_details || "";
+        row["Meter"] = pub.meter || "";
+        row["Season"] = pub.season || "";
+        row["Tune"] = pub.tune || "";
+        row["Psalm Number"] = pub.psalm_number || "";
+        row["General Details"] = pub.general_details || "";
 
-        row["Tune Details"]            = pub.tune_copyright_notice || "";
-        row["Country Restrictions"]    = pub.country_restrictions || "";
-        row["Is Public Domain"]        = pub.is_public_domain                ? "Yes" : "No";
-        row["Can Be Reprinted"]        = pub.can_be_reprinted                ? "Yes" : "No";
-        row["Can Be Podcast/Streamed"] = pub.can_be_podcast_streamed         ? "Yes" : "No";
-        row["Can Make Commercial Recording"]     = pub.can_make_commercial_recording     ? "Yes" : "No";
+        row["Tune Details"] = pub.tune_copyright_notice || "";
+        row["Country Restrictions"] = pub.country_restrictions || "";
+        row["Is Public Domain"] = pub.is_public_domain ? "Yes" : "No";
+        row["Can Be Reprinted"] = pub.can_be_reprinted ? "Yes" : "No";
+        row["Can Be Podcast/Streamed"] = pub.can_be_podcast_streamed ? "Yes" : "No";
+        row["Can Make Commercial Recording"] = pub.can_make_commercial_recording ? "Yes" : "No";
         row["Can Make Non-commercial Recording"] = pub.can_make_non_commercial_recording ? "Yes" : "No";
 
-        for (let i = 0; i < 4; i++) {
-          const a = artists[i] || {};
+        // Additional Composition Data requested by user
+        row["Price"] = pub.price !== null && pub.price !== undefined ? pub.price : "";
+        row["Date Published"] = formattedPublishedAt;
+        row["Collection(s)"] = pub.collection_name || "";
+        row["Vocal Parts"] = parsedVocalParts;
+        row["Instrumentation"] = parsedInstrumentation;
+        row["Music Type"] = pub.types_of_music || "";
+        row["Liturgical Text"] = pub.liturgicalText || "";
+        row["Verse Style"] = pub.verseStyle || "";
+        row["Feast/Celebration"] = parsedFeast;
+        row["Entrance/Communion (Antiphon)"] = entranceCommunionAntiphon;
+        row["Liturgical Season"] = pub.season || "";
+        row["Theme"] = parsedTheme;
+        row["Sacrament"] = pub.liturgicalSacrament || "";
+        row["Part of Mass"] = parsedPartOfMass;
+        row["Liturgical Day (Sequence)"] = parsedLiturgicalDaySequence;
+        row["Files / Buckets"] = parsedFilesBuckets;
 
-          row[`Artist${i + 1} Title`]      = a.title      || "";
-          row[`Artist${i + 1} First name`] = a.first_name || "";
-
-          let lastSuffix = a.last_name || "";
-          if (a.suffix) lastSuffix += ` | ${a.suffix}`;
-          row[`Artist${i + 1} Last | Artist${i + 1} Suffix`] = lastSuffix;
-
-          row[`Artist${i + 1} Role`]        = a.role || "";
-          row[`Artist${i + 1} Royalty Per`] = a.royalty_percentage ?? a.royalty_per ?? "";
-        }
-
+        row._artists = artists;
         return row;
       };
 
@@ -629,45 +828,82 @@ app.get('/export-music', auth, async (req, res) => {
 
       if (Array.isArray(massParts) && massParts.length > 0) {
         return massParts.map((id) => {
-          const def       = MASS_SETTING_PARTS.find((p) => p.id === id);
-          const row       = baseRow();
+          const def = MASS_SETTING_PARTS.find((p) => p.id === id);
+          const row = baseRow();
           const titleBase = pub.composition_title || "";
-          const partName  = def ? def.name : id;
-          row["Title"]        = titleBase && partName ? `${titleBase} - ${partName}` : titleBase || partName || "";
+          const partName = def ? def.name : id;
+          row["Title"] = titleBase && partName ? `${titleBase} - ${partName}` : titleBase || partName || "";
           row["Text Details"] = (def && def.textCopyright) || pub.text_copyright_notice || "";
           return row;
         });
       }
 
       // ── Single-row publication ────────────────────────────────────────────
-      const singleRow         = baseRow();
-      singleRow["Title"]        = pub.composition_title || "";
+      const singleRow = baseRow();
+      singleRow["Title"] = pub.composition_title || "";
       singleRow["Text Details"] = pub.text_copyright_notice || "";
       return [singleRow];
     };
 
     const formattedRows = Array.isArray(rows) ? rows.flatMap(buildRows) : [];
 
+    // Determine the maximum number of artists across all publications
+    let maxArtists = 4; // Start with at least 4 default columns as fallback
+    formattedRows.forEach((r) => {
+      if (r._artists && r._artists.length > maxArtists) {
+        maxArtists = r._artists.length;
+      }
+    });
+
+    // Populate the artist columns dynamically for each row
+    formattedRows.forEach((row) => {
+      const rowArtists = row._artists || [];
+      for (let i = 0; i < maxArtists; i++) {
+        const a = rowArtists[i] || {};
+        const title = a.title || "";
+        const firstName = a.firstName || a.first_name || "";
+        const lastName = a.lastName || a.last_name || "";
+        const suffix = a.suffix || "";
+        const role = a.role || "";
+        const royaltyPer = a.royaltyPercent ?? a.royalty_percentage ?? a.royalty_per ?? "";
+
+        // row[`Artist${i + 1} Title`]      = title;
+        row[`Artist${i + 1} First name`] = firstName;
+
+        let lastSuffix = lastName;
+        if (suffix) lastSuffix += ` | ${suffix}`;
+        row[`Artist${i + 1} Last name`] = lastSuffix;
+
+        row[`Artist${i + 1} Role`] = role;
+        row[`Artist${i + 1} Royalty Per`] = royaltyPer;
+      }
+      delete row._artists; // clean up temporary property
+    });
+
     // Column order fallback if no rows
     const columnOrder = formattedRows.length > 0
       ? Object.keys(formattedRows[0])
       : [
-          'Music ID', 'ONE LICENSE ID', 'Title', 'First line', 'Copyright Year',
-          'Song Type', 'Language', 'Meter', 'Season', 'Tune', 'Psalm Number',
-          'General Details', 'Text Details', 'Tune Details', 'Country Restrictions',
-          'Is Public Domain', 'Can Be Reprinted', 'Can Be Podcast/Streamed',
-          'Can Make Commercial Recording', 'Can Make Non-commercial Recording',
-          ...Array.from({ length: 4 }).flatMap((_, i) => {
-            const n = i + 1;
-            return [
-              `Artist${n} Title`,
-              `Artist${n} First name`,
-              `Artist${n} Last | Artist${n} Suffix`,
-              `Artist${n} Role`,
-              `Artist${n} Royalty Per`
-            ];
-          })
-        ];
+        'Music ID', 'ONE LICENSE ID', 'Title', 'First line', 'Copyright Year',
+        'Song Type', 'Language', 'Meter', 'Season', 'Tune', 'Psalm Number',
+        'General Details', 'Text Details', 'Tune Details', 'Country Restrictions',
+        'Is Public Domain', 'Can Be Reprinted', 'Can Be Podcast/Streamed',
+        'Can Make Commercial Recording', 'Can Make Non-commercial Recording',
+        'Price', 'Date Published', 'Collection(s)', 'Vocal Parts', 'Instrumentation',
+        'Music Type', 'Liturgical Text', 'Verse Style', 'Feast/Celebration',
+        'Entrance/Communion (Antiphon)', 'Liturgical Season', 'Theme', 'Sacrament',
+        'Part of Mass', 'Liturgical Day (Sequence)', 'Files / Buckets',
+        ...Array.from({ length: maxArtists }).flatMap((_, i) => {
+          const n = i + 1;
+          return [
+            `Artist${n} Title`,
+            `Artist${n} First name`,
+            `Artist${n} Last | Artist${n} Suffix`,
+            `Artist${n} Role`,
+            `Artist${n} Royalty Per`
+          ];
+        })
+      ];
 
     // Ensure every row has all columns (no missing keys)
     const orderedData = formattedRows.map(r => {
@@ -681,7 +917,7 @@ app.get('/export-music', auth, async (req, res) => {
     worksheet['!cols'] = columnOrder.map((col) => {
       if (col.includes("Title") || col.includes("Details") || col.includes("General")) return { wch: 30 };
       if (col.includes("First line")) return { wch: 40 };
-      if (col.includes("First name") || col.includes("Last"))                          return { wch: 20 };
+      if (col.includes("First name") || col.includes("Last")) return { wch: 20 };
       return { wch: 15 };
     });
 
@@ -689,7 +925,7 @@ app.get('/export-music', auth, async (req, res) => {
     XLSX.utils.book_append_sheet(workbook, worksheet, "Music Export");
 
     // Buffer-only export — immediate download
-    const buffer   = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
+    const buffer = XLSX.write(workbook, { type: "buffer", bookType: "xlsx" });
     const filename = `Musics_${Date.now()}.xlsx`;
 
     res.setHeader("Content-Disposition", `attachment; filename="${filename}"`);
@@ -821,15 +1057,26 @@ const startServer = async () => {
     // Connect to MySQL database
     await connectMySQL();
 
-    app.listen(PORT, () => {
+    // Create HTTP server for Express + Socket.IO
+    const httpServer = http.createServer(app);
+
+    // Initialize Socket.IO
+    initSocket(httpServer);
+
+    // Start cron jobs
+    initSubscriptionCronJobs();
+
+    // Start HTTP server
+    httpServer.listen(PORT, () => {
       console.log(`🚀 Server running on port ${PORT}`);
       console.log(`🌍 Environment: ${process.env.NODE_ENV}`);
       console.log(`⏰ Request timeout: 120 seconds`);
       console.log(`📋 Available at: http://localhost:${PORT}`);
-      // console.log(`✅ Activity logging enabled for authenticated users`);
+      console.log(`🔌 Socket.IO available at: ws://localhost:${PORT}/socket.io`);
     });
+
   } catch (error) {
-    console.error('❌ Failed to start server:', error);
+    console.error("❌ Failed to start server:", error);
     process.exit(1);
   }
 };

@@ -101,12 +101,55 @@ const handleWebhookEvent = async (event) => {
       case 'customer.subscription.deleted':
         await handleSubscriptionCancelled(event.data.object);
         break;
+      case 'transfer.created':
+      case 'payout.paid':
+      case 'payout.failed':
+        await handlePayoutWebhookEvent(event);
+        break;
       default:
         console.log(`Unhandled event type: ${event.type}`);
     }
   } catch (error) {
     console.error('Error handling webhook event:', error);
     throw error;
+  }
+};
+
+/**
+ * Handle Stripe Transfer & Payout events for Royalty Records
+ */
+const handlePayoutWebhookEvent = async (event) => {
+  const { getMySQLConnection } = require('./mysql');
+  const mysql = getMySQLConnection();
+
+  const obj = event.data.object;
+  const transferId = obj.id;
+  const royaltyId = obj.metadata?.royaltyId;
+
+  if (!royaltyId && !transferId) return;
+
+  if (event.type === 'transfer.created' || event.type === 'payout.paid') {
+    let whereClause = royaltyId ? 'id = ?' : 'stripe_transfer_id = ?';
+    let param = royaltyId || transferId;
+
+    await mysql.execute(
+      `UPDATE composer_earnings 
+       SET stripe_status = 'succeeded', payment_status = 'STRIPE_PAID' 
+       WHERE ${whereClause}`,
+      [param]
+    );
+    console.log(`✅ Stripe payout event ${event.type} processed for ${param}`);
+  } else if (event.type === 'payout.failed') {
+    let whereClause = royaltyId ? 'id = ?' : 'stripe_transfer_id = ?';
+    let param = royaltyId || transferId;
+
+    await mysql.execute(
+      `UPDATE composer_earnings 
+       SET stripe_status = 'failed', payment_status = 'PAYOUT_FAILED', payout_error = ? 
+       WHERE ${whereClause}`,
+      [obj.failure_message || 'Stripe payout failed', param]
+    );
+    console.log(`❌ Stripe payout event ${event.type} recorded for ${param}`);
   }
 };
 

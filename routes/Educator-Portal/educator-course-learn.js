@@ -282,6 +282,7 @@ router.get("/:courseId", auth, async (req, res) => {
         const [lessons] = await mysql.execute(
             `SELECT
                 cl.id, cl.chapter_id, cl.title, cl.lesson_type, cl.content, cl.video_url,
+                cl.link_url, cl.link_title,
                 cl.video_duration_minutes, cl.downloadable_files, cl.lesson_order,
                 cl.is_preview, cl.is_mandatory,
                 COALESCE(lp.is_completed, 0)       AS is_completed,
@@ -365,24 +366,29 @@ router.get("/:courseId", auth, async (req, res) => {
             else finalQuiz = formatted;
         });
 
-        const formattedLessons = lessons.map((l) => ({
-            id: l.id,
-            chapter_id: l.chapter_id,
-            title: l.title,
-            lesson_type: l.lesson_type,
-            content: l.content,
-            video_url: l.video_url,
-            video_duration_minutes: l.video_duration_minutes,
-            downloadable_files: parseJSON(l.downloadable_files, []),
-            lesson_order: l.lesson_order,
-            is_preview: !!l.is_preview,
-            is_mandatory: !!l.is_mandatory,
-            is_completed: !!l.is_completed,
-            completed_at: l.completed_at,
-            time_spent_minutes: l.time_spent_minutes,
-            resources: resourcesByLesson[l.id] || [],
-            quiz: lessonQuizByLessonId[l.id] || null
-        }));
+        const formattedLessons = lessons.map((l) => {
+            const rawType = (l.lesson_type || "").toLowerCase();
+            return {
+                id: l.id,
+                chapter_id: l.chapter_id,
+                title: l.title,
+                lesson_type: l.lesson_type,
+                content: l.content,
+                video_url: l.video_url,
+                link_url: l.link_url || (rawType === "external_link" ? l.video_url : null),
+                link_title: l.link_title || null,
+                video_duration_minutes: l.video_duration_minutes,
+                downloadable_files: parseJSON(l.downloadable_files, []),
+                lesson_order: l.lesson_order,
+                is_preview: !!l.is_preview,
+                is_mandatory: !!l.is_mandatory,
+                is_completed: !!l.is_completed,
+                completed_at: l.completed_at,
+                time_spent_minutes: l.time_spent_minutes,
+                resources: resourcesByLesson[l.id] || [],
+                quiz: lessonQuizByLessonId[l.id] || null
+            };
+        });
 
         const chaptersWithLessons = chapters.map((chapter) => {
             const chapterLessons = formattedLessons

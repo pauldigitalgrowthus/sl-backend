@@ -13,6 +13,354 @@ const slugify = (text) => {
 }
 const router = express.Router();
 
+// =============================================================
+// 🗂️ In-memory job store for the "sync all roles' users" bulk route.
+// Mirrors the pattern used in auth.js's sync-active-campaign-all —
+// runs in the background and is polled via a status route so it
+// never hits the server's global 120s request timeout.
+// Lives only in process memory (no DB change) and resets on restart.
+// =============================================================
+const acRoleSyncJobs = new Map();
+// =============================================================
+// 🏷️ ActiveCampaign Tag Helpers
+// =============================================================
+// These keep the role_permissions.ac_tag_id column in sync with
+// ActiveCampaign so future updates/deletes don't rely on matching
+// by name (names can change, IDs don't).
+
+async function createActiveCampaignTag(tagName, description) {
+    try {
+        const createResponse = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags`, {
+            method: "POST",
+            headers: {
+                "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                tag: {
+                    tag: tagName,
+                    tagType: "contact",
+                    description,
+                },
+            }),
+        });
+
+        const createData = await createResponse.json();
+
+        if (createResponse.ok) {
+            return createData.tag;
+        }
+
+        console.error(`Failed to create AC tag "${tagName}"`, createData);
+        return null;
+    } catch (err) {
+        console.error(`Error creating AC tag "${tagName}":`, err.message);
+        return null;
+    }
+}
+
+async function updateActiveCampaignTag(tagId, tagName, description) {
+    if (!tagId) return null;
+    try {
+        const updateResponse = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags/${tagId}`, {
+            method: "PUT",
+            headers: {
+                "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                tag: {
+                    tag: tagName,
+                    tagType: "contact",
+                    description,
+                },
+            }),
+        });
+
+        const updateData = await updateResponse.json();
+
+        if (updateResponse.ok) {
+            return updateData.tag;
+        }
+
+        console.error(`Failed to update AC tag ${tagId}`, updateData);
+        return null;
+    } catch (err) {
+        console.error(`Error updating AC tag ${tagId}:`, err.message);
+        return null;
+    }
+}
+
+async function deleteActiveCampaignTag(tagId) {
+    if (!tagId) return false;
+    try {
+        const deleteResponse = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags/${tagId}`, {
+            method: "DELETE",
+            headers: {
+                "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                "Content-Type": "application/json",
+            },
+        });
+
+        // AC returns 200/204 on success; treat 404 as "already gone" (not an error)
+        if (!deleteResponse.ok && deleteResponse.status !== 404) {
+            console.error(`Failed to delete AC tag ${tagId}, status: ${deleteResponse.status}`);
+            return false;
+        }
+        return true;
+    } catch (err) {
+        console.error(`Error deleting AC tag ${tagId}:`, err.message);
+        return false;
+    }
+}
+
+// =============================================================
+// 👤 ActiveCampaign Contact Sync (for users carrying this role's badge)
+// =============================================================
+async function syncActiveCampaignContact({ email, firstName, lastName, phone }) {
+    try {
+        const syncResponse = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/contact/sync`, {
+            method: "POST",
+            headers: {
+                "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                contact: {
+                    email,
+                    firstName: firstName || "",
+                    lastName: lastName || "",
+                    ...(phone ? { phone } : {}),
+                },
+            }),
+        });
+
+        const syncData = await syncResponse.json();
+
+        if (syncResponse.ok) {
+            return syncData.contact;
+        }
+
+        console.error(`Failed to sync AC contact "${email}"`, syncData);
+        return null;
+    } catch (err) {
+        console.error(`Error syncing AC contact "${email}":`, err.message);
+        return null;
+    }
+}
+
+async function addTagToActiveCampaignContact(contactId, tagId) {
+    if (!contactId || !tagId) return false;
+    try {
+        const response = await fetch(`${process.env.ACTIVE_CAMPAIGN_URL}/api/3/contactTags`, {
+            method: "POST",
+            headers: {
+                "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                "Content-Type": "application/json",
+            },
+            body: JSON.stringify({
+                contactTag: {
+                    contact: contactId,
+                    tag: tagId,
+                },
+            }),
+        });
+
+        // AC returns 422 if the tag is already applied to the contact — that's fine
+        if (response.ok || response.status === 422) {
+            return true;
+        }
+
+        const data = await response.json().catch(() => ({}));
+        console.error(`Failed to add tag ${tagId} to contact ${contactId}`, data);
+        return false;
+    } catch (err) {
+        console.error(`Error adding tag ${tagId} to contact ${contactId}:`, err.message);
+        return false;
+    }
+}
+
+// Resolve (or create + persist) a role's AC tag ID
+async function getOrCreateRoleTag(mysqlConnection, roleName) {
+    try {
+        const [rows] = await mysqlConnection.execute(
+            'SELECT id, ac_tag_id FROM role_permissions WHERE role_name = ?',
+            [roleName]
+        );
+
+        const roleRow = rows[0] || null;
+
+        if (roleRow?.ac_tag_id) {
+            return { id: roleRow.ac_tag_id };
+        }
+
+        const tag = await createActiveCampaignTag(roleName, `${roleName} role`);
+
+        if (tag && roleRow) {
+            await mysqlConnection.execute(
+                'UPDATE role_permissions SET ac_tag_id = ? WHERE id = ?',
+                [tag.id, roleRow.id]
+            );
+        }
+
+        return tag;
+    } catch (err) {
+        console.error(`Error resolving AC tag for role "${roleName}":`, err.message);
+        return null;
+    }
+}
+
+// Resolve (or create + persist) a plan's AC tag ID — plans live in the `plans` table
+async function getOrCreatePlanTag(mysqlConnection, planName, planId) {
+    try {
+        const [rows] = await mysqlConnection.execute(
+            'SELECT ac_tag_id FROM plans WHERE id = ?',
+            [planId]
+        );
+
+        const existingTagId = rows[0]?.ac_tag_id;
+
+        if (existingTagId) {
+            return { id: existingTagId };
+        }
+
+        const tag = await createActiveCampaignTag(planName, `Plan: ${planName}`);
+
+        if (tag) {
+            await mysqlConnection.execute(
+                'UPDATE plans SET ac_tag_id = ? WHERE id = ?',
+                [tag.id, planId]
+            );
+        }
+
+        return tag;
+    } catch (err) {
+        console.error(`Error resolving AC tag for plan "${planName}":`, err.message);
+        return null;
+    }
+}
+
+// Full resync of ONE user (contact + all their current badge tags + plan tag).
+// Same logic used across the codebase (auth.js) — duplicated here so this
+// route file doesn't need a cross-file import.
+async function syncUserToActiveCampaign(mysqlConnection, userId) {
+    const [users] = await mysqlConnection.execute(
+        `SELECT id, first_name, last_name, email, phone, badges,
+                current_plan_id, plan_status
+         FROM users WHERE id = ?`,
+        [userId]
+    );
+
+    if (!users.length) {
+        return { success: false, userId, error: 'User not found' };
+    }
+
+    const user = users[0];
+
+    let badges = [];
+    try {
+        badges = user.badges ? JSON.parse(user.badges) : [];
+    } catch {
+        badges = [];
+    }
+
+    // Never sync "Manager"/"Minister" badges to ActiveCampaign (internal-only)
+    const excludedBadgePattern = /manager|minister/i;
+    const syncableBadges = badges.filter((b) => b && !excludedBadgePattern.test(b));
+
+    let planName = null;
+    if (user.current_plan_id && user.plan_status === 'active') {
+        const [plans] = await mysqlConnection.execute(
+            'SELECT name FROM plans WHERE id = ? AND is_active = TRUE',
+            [user.current_plan_id]
+        );
+        if (plans.length) planName = plans[0].name;
+    }
+
+    const contact = await syncActiveCampaignContact({
+        email: user.email,
+        firstName: user.first_name,
+        lastName: user.last_name,
+        phone: user.phone,
+    });
+
+    if (!contact) {
+        return { success: false, userId, email: user.email, error: 'Failed to sync contact to ActiveCampaign' };
+    }
+
+    const appliedTags = [];
+    const failedTags = [];
+
+    for (const badgeName of syncableBadges) {
+        const tag = await getOrCreateRoleTag(mysqlConnection, badgeName);
+        if (tag) {
+            const ok = await addTagToActiveCampaignContact(contact.id, tag.id);
+            (ok ? appliedTags : failedTags).push(badgeName);
+        } else {
+            failedTags.push(badgeName);
+        }
+    }
+
+    if (planName) {
+        const tag = await getOrCreatePlanTag(mysqlConnection, planName, user.current_plan_id);
+        if (tag) {
+            const ok = await addTagToActiveCampaignContact(contact.id, tag.id);
+            (ok ? appliedTags : failedTags).push(planName);
+        } else {
+            failedTags.push(planName);
+        }
+    }
+
+    return { success: true, userId: user.id, contactId: contact.id, email: user.email, appliedTags, failedTags };
+}
+
+// Re-sync every active user who currently carries this role's badge.
+// Runs sequentially in the background (fire-and-forget from the caller)
+// so a role rename/update/delete never blocks the actual API response.
+async function syncUsersForRole(mysqlConnection, roleName) {
+    try {
+        const [users] = await mysqlConnection.execute(
+            `SELECT id FROM users
+             WHERE is_active = 1 AND deleted_at IS NULL
+               AND JSON_CONTAINS(badges, JSON_QUOTE(?))`,
+            [roleName]
+        );
+
+        if (!users.length) {
+            console.log(`ℹ️ [AC ROLE SYNC] No users currently have badge "${roleName}" — nothing to sync`);
+            return { total: 0, succeeded: 0, failed: 0 };
+        }
+
+        console.log(`🚀 [AC ROLE SYNC] Re-syncing ${users.length} user(s) with badge "${roleName}"...`);
+
+        let succeeded = 0;
+        let failed = 0;
+
+        for (const { id: userId } of users) {
+            try {
+                const result = await syncUserToActiveCampaign(mysqlConnection, userId);
+                result.success ? succeeded++ : failed++;
+            } catch (err) {
+                console.error(`❌ [AC ROLE SYNC] Error syncing user ${userId}:`, err.message);
+                failed++;
+            }
+        }
+
+        console.log(`✅ [AC ROLE SYNC] Done for "${roleName}". Synced ${succeeded}/${users.length}, failed ${failed}.`);
+        return { total: users.length, succeeded, failed };
+    } catch (err) {
+        console.error(`❌ [AC ROLE SYNC] Failed to sync users for role "${roleName}":`, err.message);
+        return { total: 0, succeeded: 0, failed: 0, error: err.message };
+    }
+}
+
+// Fire-and-forget wrapper — call right before responding so a role
+// create/update/delete never waits on ActiveCampaign.
+function triggerRoleUsersSync(mysqlConnection, roleName, context = '') {
+    syncUsersForRole(mysqlConnection, roleName)
+        .catch((err) => console.error(`⚠️ [AC ROLE SYNC${context ? ':' + context : ''}] threw:`, err.message));
+}
+
 // ================================ SL TEAM / ADMIN Roles ROUTES ================================
 
 // =============================================================
@@ -41,10 +389,26 @@ router.post('/', async (req, res) => {
         }
 
         // Insert new role
-        await mysqlConnection.execute(
+        const [insertResult] = await mysqlConnection.execute(
             'INSERT INTO role_permissions (role_name, permissions, slug) VALUES (?, ?, ?)',
             [role_name, JSON.stringify(permissions), slug]
         );
+
+        // 🏷️ Create matching ActiveCampaign tag & store its ID against this role
+        let activeCampaignTag = null;
+        try {
+            activeCampaignTag = await createActiveCampaignTag(role_name, `${role_name} role`);
+
+            if (activeCampaignTag) {
+                await mysqlConnection.execute(
+                    'UPDATE role_permissions SET ac_tag_id = ? WHERE id = ?',
+                    [activeCampaignTag.id, insertResult.insertId]
+                );
+            }
+        } catch (acError) {
+            console.error('❌ Failed to create ActiveCampaign tag for role:', acError.message);
+            // Don't fail the request, just log the error
+        }
 
         // 🔄 Automatically update user_type ENUM to include new slug
         try {
@@ -56,7 +420,11 @@ router.post('/', async (req, res) => {
             // Don't fail the request, just log the error
         }
 
-        return successResponse(res, { role_name, permissions, slug }, 'Role created successfully');
+        // 🔗 Re-sync any users who already carry this badge name to ActiveCampaign
+        // (e.g. the role was deleted and re-created with the same name) — non-blocking
+        triggerRoleUsersSync(mysqlConnection, role_name, 'role-create');
+
+        return successResponse(res, { role_name, permissions, slug, activeCampaignTag }, 'Role created successfully');
     } catch (err) {
         console.error('Error creating role permission:', err);
         return errorResponse(res, 'Error creating role permission');
@@ -64,27 +432,131 @@ router.post('/', async (req, res) => {
 });
 
 // =============================================================
-// 🟡 GET ALL ROLES
+// GET ALL ROLES
 // =============================================================
 // @route   GET /api/roles-permissions/roles
-// @desc    Get all roles with their permissions
-// @access  Private (SL Team/Admin only)
-router.get('/', async (req, res) => {
+// @desc    Get all roles with their permissions + ActiveCampaign Tags
+// @access  Private
+router.get("/", async (req, res) => {
     try {
         const mysqlConnection = getMySQLConnection();
-        const [rows] = await mysqlConnection.execute('SELECT * FROM role_permissions');
+
+        const [rows] = await mysqlConnection.execute(
+            "SELECT * FROM role_permissions"
+        );
+
         const data = rows.map((r) => ({
             id: r.id,
             role_name: r.role_name,
             slug: r.slug,
-            permissions: JSON.parse(r.permissions || '{}'),
+            ac_tag_id: r.ac_tag_id || null,
+            permissions: JSON.parse(r.permissions || "{}"),
             created_at: r.created_at,
         }));
 
-        return successResponse(res, data, 'All roles fetched successfully');
+        const rolesWithTags = await Promise.all(
+            data.map(async (role) => {
+                try {
+                    let tag = null;
+
+                    // ----------------------------------------
+                    // If we already have the AC tag ID saved, use it directly
+                    // (no need to search by name every time)
+                    // ----------------------------------------
+                    if (role.ac_tag_id) {
+                        const getResponse = await fetch(
+                            `${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags/${role.ac_tag_id}`,
+                            {
+                                headers: {
+                                    "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                                    "Content-Type": "application/json",
+                                },
+                            }
+                        );
+
+                        if (getResponse.ok) {
+                            const getData = await getResponse.json();
+                            tag = getData.tag || null;
+                        }
+                    }
+
+                    // ----------------------------------------
+                    // Fallback: search by slug (legacy roles without ac_tag_id)
+                    // ----------------------------------------
+                    if (!tag) {
+                        const searchResponse = await fetch(
+                            `${process.env.ACTIVE_CAMPAIGN_URL}/api/3/tags?search=${encodeURIComponent(
+                                role.slug
+                            )}`,
+                            {
+                                headers: {
+                                    "Api-Token": process.env.ACTIVE_CAMPAIGN_API_KEY,
+                                    "Content-Type": "application/json",
+                                },
+                            }
+                        );
+
+                        const searchData = await searchResponse.json();
+
+                        if (
+                            searchResponse.ok &&
+                            Array.isArray(searchData.tags) &&
+                            searchData.tags.length
+                        ) {
+                            tag = searchData.tags.find(
+                                (t) =>
+                                    t.tag.toLowerCase() === role.slug.toLowerCase()
+                            );
+                        }
+                    }
+
+                    // ----------------------------------------
+                    // Create tag if still not found
+                    // ----------------------------------------
+                    if (!tag) {
+                        tag = await createActiveCampaignTag(
+                            role.role_name,
+                            `${role.role_name} role`
+                        );
+                    }
+
+                    // ----------------------------------------
+                    // Persist the tag ID so future requests skip the search
+                    // ----------------------------------------
+                    if (tag && tag.id != role.ac_tag_id) {
+                        await mysqlConnection.execute(
+                            "UPDATE role_permissions SET ac_tag_id = ? WHERE id = ?",
+                            [tag.id, role.id]
+                        );
+                        role.ac_tag_id = tag.id;
+                    }
+
+                    return {
+                        ...role,
+                        activeCampaignTag: tag || null,
+                    };
+                } catch (err) {
+                    console.error(
+                        `Error processing role ${role.slug}:`,
+                        err.message
+                    );
+
+                    return {
+                        ...role,
+                        activeCampaignTag: null,
+                    };
+                }
+            })
+        );
+
+        return successResponse(
+            res,
+            rolesWithTags,
+            "All roles fetched successfully"
+        );
     } catch (err) {
         console.error(err);
-        return errorResponse(res, 'Error fetching roles');
+        return errorResponse(res, "Error fetching roles");
     }
 });
 
@@ -182,6 +654,38 @@ router.put('/:role_name', async (req, res) => {
         );
         console.log(`✅ Role_permissions table updated successfully`);
 
+        // 🏷️ Keep the ActiveCampaign tag in sync if the role was renamed
+        let activeCampaignTag = null;
+        if (finalRoleName !== role_name) {
+            try {
+                const existingAcTagId = rows[0].ac_tag_id;
+
+                if (existingAcTagId) {
+                    activeCampaignTag = await updateActiveCampaignTag(
+                        existingAcTagId,
+                        finalRoleName,
+                        `${finalRoleName} role`
+                    );
+                } else {
+                    // No tag was ever linked — create one now and save its ID
+                    activeCampaignTag = await createActiveCampaignTag(
+                        finalRoleName,
+                        `${finalRoleName} role`
+                    );
+
+                    if (activeCampaignTag) {
+                        await mysqlConnection.execute(
+                            'UPDATE role_permissions SET ac_tag_id = ? WHERE slug = ?',
+                            [activeCampaignTag.id, newSlug]
+                        );
+                    }
+                }
+            } catch (acError) {
+                console.error('❌ Failed to sync ActiveCampaign tag on role rename:', acError.message);
+                // Don't fail the request, just log the error
+            }
+        }
+
         // ✅ Update all users with role='sl_team' and user_type matching old slug
         const [affectedUsers] = await mysqlConnection.execute(
             'SELECT id, email, user_type, permissions, badges FROM users WHERE role = ? AND user_type = ?',
@@ -260,8 +764,15 @@ router.put('/:role_name', async (req, res) => {
             role_name: finalRoleName,
             slug: newSlug,
             permissions,
-            updated_users: affectedUsers.length
+            updated_users: affectedUsers.length,
+            activeCampaignTag
         };
+
+        // 🔗 Re-sync every user who carries this badge to ActiveCampaign (non-blocking)
+        triggerRoleUsersSync(mysqlConnection, finalRoleName, 'role-update');
+        if (finalRoleName !== role_name) {
+            triggerRoleUsersSync(mysqlConnection, role_name, 'role-update-old-name');
+        }
 
         console.log(`\n🎉 [PUT] Role update completed successfully!`);
         console.log(`📋 Response data:`, responseData);
@@ -301,7 +812,7 @@ router.patch('/update-multiple', [auth,
            1️⃣ FETCH EXISTING ROLE
         -------------------------------------------------- */
         const [rows] = await mysqlConnection.execute(
-            'SELECT permissions FROM role_permissions WHERE role_name = ?',
+            'SELECT permissions, ac_tag_id FROM role_permissions WHERE role_name = ?',
             [role_name]
         );
 
@@ -352,6 +863,36 @@ router.patch('/update-multiple', [auth,
                 role_name
             ]
         );
+
+        // 🏷️ Keep the ActiveCampaign tag in sync if the role was renamed
+        if (finalRoleName !== role_name) {
+            try {
+                const existingAcTagId = rows[0].ac_tag_id;
+
+                if (existingAcTagId) {
+                    await updateActiveCampaignTag(
+                        existingAcTagId,
+                        finalRoleName,
+                        `${finalRoleName} role`
+                    );
+                } else {
+                    const newTag = await createActiveCampaignTag(
+                        finalRoleName,
+                        `${finalRoleName} role`
+                    );
+
+                    if (newTag) {
+                        await mysqlConnection.execute(
+                            'UPDATE role_permissions SET ac_tag_id = ? WHERE slug = ?',
+                            [newTag.id, newSlug]
+                        );
+                    }
+                }
+            } catch (acError) {
+                console.error('❌ Failed to sync ActiveCampaign tag on role rename:', acError.message);
+                // Don't fail the request, just log the error
+            }
+        }
 
         /* --------------------------------------------------
            4️⃣ FIND ALL USERS HAVING THIS BADGE
@@ -434,6 +975,12 @@ router.patch('/update-multiple', [auth,
         /* --------------------------------------------------
            7️⃣ RESPONSE
         -------------------------------------------------- */
+        // 🔗 Re-sync every user with this badge to ActiveCampaign (non-blocking)
+        triggerRoleUsersSync(mysqlConnection, finalRoleName, 'role-patch');
+        if (finalRoleName !== role_name) {
+            triggerRoleUsersSync(mysqlConnection, role_name, 'role-patch-old-name');
+        }
+
         return successResponse(
             res,
             {
@@ -470,13 +1017,15 @@ router.delete('/:role_name', [auth], async (req, res) => {
            1️⃣ CHECK ROLE EXISTS
         -------------------------------------------------- */
         const [roles] = await mysqlConnection.execute(
-            'SELECT role_name FROM role_permissions WHERE role_name = ?',
+            'SELECT role_name, ac_tag_id FROM role_permissions WHERE role_name = ?',
             [role_name]
         );
 
         if (!roles.length) {
             return errorResponse(res, 'Role not found', 404);
         }
+
+        const roleAcTagId = roles[0].ac_tag_id;
 
         /* --------------------------------------------------
            2️⃣ FIND USERS HAVING THIS BADGE
@@ -591,7 +1140,17 @@ router.delete('/:role_name', [auth], async (req, res) => {
         }
 
         /* --------------------------------------------------
-           5️⃣ DELETE ROLE FROM role_permissions
+           5️⃣ DELETE ROLE'S ActiveCampaign TAG
+        -------------------------------------------------- */
+        if (roleAcTagId) {
+            const deleted = await deleteActiveCampaignTag(roleAcTagId);
+            if (!deleted) {
+                console.error(`⚠️ Could not delete AC tag ${roleAcTagId} for role "${role_name}" — continuing anyway`);
+            }
+        }
+
+        /* --------------------------------------------------
+           6️⃣ DELETE ROLE FROM role_permissions
         -------------------------------------------------- */
         await mysqlConnection.execute(
             'DELETE FROM role_permissions WHERE role_name = ?',
@@ -601,6 +1160,23 @@ router.delete('/:role_name', [auth], async (req, res) => {
         /* --------------------------------------------------
            6️⃣ RESPONSE
         -------------------------------------------------- */
+        // 🔗 Re-sync every previously-affected user to ActiveCampaign (non-blocking).
+        // The deleted role's tag is already gone from AC (and therefore from
+        // every contact automatically) — this just refreshes their remaining
+        // badge/plan tags and contact info.
+        if (users.length) {
+            (async () => {
+                for (const u of users) {
+                    try {
+                        await syncUserToActiveCampaign(mysqlConnection, u.id);
+                    } catch (err) {
+                        console.error(`⚠️ [AC ROLE DELETE SYNC] Failed to resync user ${u.id}:`, err.message);
+                    }
+                }
+                console.log(`✅ [AC ROLE DELETE SYNC] Re-synced ${users.length} previously-affected user(s) after deleting role "${role_name}"`);
+            })().catch((err) => console.error('⚠️ [AC ROLE DELETE SYNC] threw:', err.message));
+        }
+
         return successResponse(
             res,
             {
@@ -615,6 +1191,133 @@ router.delete('/:role_name', [auth], async (req, res) => {
         console.error('❌ DELETE ROLE ERROR:', error);
         return errorResponse(res, 'Failed to delete role', 500);
     }
+});
+
+// =============================================================
+// 🔗 MANUAL SYNC — Re-sync every user carrying a role's badge to AC
+// =============================================================
+// @route   POST /api/roles-permissions/roles/:role_name/sync-users
+// @desc    Manually re-sync ActiveCampaign contact + tags for every
+//          active user who currently carries this role's badge.
+//          Useful right after bulk badge assignments, or just to
+//          force a refresh without waiting for a rename/update.
+// @access  Private (SL Team/Admin)
+router.post('/:role_name/sync-users', [auth], async (req, res) => {
+    try {
+        const { role_name } = req.params;
+        const mysqlConnection = getMySQLConnection();
+
+        const [roleRows] = await mysqlConnection.execute(
+            'SELECT id FROM role_permissions WHERE role_name = ?',
+            [role_name]
+        );
+
+        if (!roleRows.length) {
+            return errorResponse(res, 'Role not found', 404);
+        }
+
+        // Respond immediately, then sync in the background — a badge with
+        // a lot of users could otherwise exceed the server's 120s timeout.
+        successResponse(
+            res,
+            { role_name },
+            `Sync started for users with badge "${role_name}". Check server logs for progress.`,
+            202
+        );
+
+        triggerRoleUsersSync(mysqlConnection, role_name, 'manual-sync-users');
+    } catch (err) {
+        console.error('❌ Sync users for role error:', err);
+        return errorResponse(res, 'Failed to sync users for this role');
+    }
+});
+
+// =============================================================
+// 🔗 BULK SYNC — Re-sync EVERY role's users to ActiveCampaign
+// =============================================================
+// @route   POST /api/roles-permissions/roles/sync-active-campaign-all
+// @desc    Goes through every role in role_permissions and re-syncs
+//          every active user carrying that badge. Runs as a BACKGROUND
+//          JOB (same pattern as auth.js's user-level bulk sync) — this
+//          responds immediately with a jobId since a full sweep across
+//          all roles can easily exceed the server's 120s timeout.
+//          Poll progress with:
+//          GET /api/roles-permissions/roles/sync-active-campaign-all/status/:jobId
+// @access  Private (SL Team/Admin)
+router.post('/sync-active-campaign-all', [auth], async (req, res) => {
+    try {
+        const mysqlConnection = getMySQLConnection();
+
+        const [roles] = await mysqlConnection.execute(
+            'SELECT role_name FROM role_permissions'
+        );
+
+        const jobId = `role-ac-sync-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+
+        const job = {
+            jobId,
+            status: 'running', // 'running' | 'completed'
+            totalRoles: roles.length,
+            processedRoles: 0,
+            totalUsersSynced: 0,
+            totalUsersFailed: 0,
+            startedAt: new Date().toISOString(),
+            finishedAt: null,
+            perRole: [],
+        };
+        acRoleSyncJobs.set(jobId, job);
+
+        // 🚀 Respond immediately — the sync itself runs after this
+        successResponse(
+            res,
+            {
+                jobId,
+                totalRoles: job.totalRoles,
+                statusUrl: `/api/roles-permissions/roles/sync-active-campaign-all/status/${jobId}`,
+            },
+            `Bulk role sync started for ${job.totalRoles} role(s). Poll the statusUrl for progress.`,
+            202
+        );
+
+        // 🔄 Run in the background (sequential, one role at a time)
+        setImmediate(async () => {
+            console.log(`🚀 [BULK ROLE AC SYNC:${jobId}] Starting sync for ${roles.length} role(s)...`);
+
+            for (const { role_name } of roles) {
+                try {
+                    const result = await syncUsersForRole(mysqlConnection, role_name);
+                    job.processedRoles += 1;
+                    job.totalUsersSynced += result.succeeded;
+                    job.totalUsersFailed += result.failed;
+                    job.perRole.push({ role_name, ...result });
+                } catch (err) {
+                    console.error(`❌ [BULK ROLE AC SYNC:${jobId}] Error syncing role "${role_name}":`, err.message);
+                    job.processedRoles += 1;
+                    job.perRole.push({ role_name, total: 0, succeeded: 0, failed: 0, error: err.message });
+                }
+            }
+
+            job.status = 'completed';
+            job.finishedAt = new Date().toISOString();
+            console.log(`✅ [BULK ROLE AC SYNC:${jobId}] Done. ${job.totalUsersSynced} user(s) synced, ${job.totalUsersFailed} failed, across ${job.totalRoles} role(s).`);
+        });
+    } catch (err) {
+        console.error('❌ Bulk role sync error:', err);
+        return errorResponse(res, 'Failed to start bulk role sync to ActiveCampaign');
+    }
+});
+
+// @route   GET /api/roles-permissions/roles/sync-active-campaign-all/status/:jobId
+// @desc    Check progress/result of a bulk role-sync job started above
+// @access  Private (SL Team/Admin)
+router.get('/sync-active-campaign-all/status/:jobId', [auth], async (req, res) => {
+    const job = acRoleSyncJobs.get(req.params.jobId);
+
+    if (!job) {
+        return errorResponse(res, 'Job not found (it may have finished and the server since restarted)', 404);
+    }
+
+    return successResponse(res, job, 'Bulk role sync job status');
 });
 
 module.exports = router;

@@ -6,7 +6,7 @@ const { courseThumbnailUpload } = require("../../config/s3")
 const {
     sendEducatorNotification,
     EDUCATOR_NOTIFICATION_EVENTS
-} = require("./utils/educatorNotificationService");
+} = require("./utils/educatorNotificationServices");
 
 const router = express.Router();
 const slugify = require("slugify");
@@ -65,9 +65,11 @@ const formatCourse = (course) => ({
 router.post("/", auth, courseThumbnailUpload.single("thumbnail"), async (req, res) => {
     try {
         const badges = JSON.parse(req.user.badges || "[]");
+        const educator_id = req.body.educator_id || req.user.id;
 
         const hasEducatorBadge = badges.some((badge) => badge.toLowerCase() === "educator");
-        if (!hasEducatorBadge) {
+        const isSuperAdmin = req.user.user_type === "superadmin";
+        if (!hasEducatorBadge && !isSuperAdmin) {
             return errorResponse(res, "Only educators can create courses", 403);
         }
 
@@ -145,12 +147,13 @@ router.post("/", auth, courseThumbnailUpload.single("thumbnail"), async (req, re
           promo_video_url,
           visibility,
           completion_required_percentage,
-          status
+          status,
+          is_created_by_admin
         ) VALUES (
-          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft'
+          ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'draft',?
         )`,
             [
-                req.user.id,
+                educator_id,
                 educator_application_id || null,
                 course_title,
                 slug,
@@ -172,7 +175,8 @@ router.post("/", auth, courseThumbnailUpload.single("thumbnail"), async (req, re
                 promo_video_url || null,
                 visibility || "private",
                 completion_required_percentage ||
-                100
+                100,
+                req.user.user_type === "superadmin" ? 1 : 0
             ]
         );
 
@@ -229,12 +233,18 @@ router.get("/my", auth, async (req, res) => {
         const limit = Number(req.query.limit) || 20;
         const offset = (page - 1) * limit;
 
-        const where = ["c.educator_id = ?", "c.deleted_at IS NULL"];
+        const where = ["c.educator_id = ?", "c.deleted_at IS NULL", "NOT (c.status = 'draft' AND c.is_created_by_admin = 1)"];
         const params = [req.user.id];
 
         if (req.query.status) {
             where.push("c.status = ?");
             params.push(req.query.status);
+        }
+        if (req.query.is_archive !== undefined) {
+            where.push("c.is_archive = ?");
+            params.push(req.query.is_archive === "true" ? 1 : 0);
+        } else {
+            where.push("c.is_archive = 0");
         }
 
         const whereClause = `WHERE ${where.join(" AND ")}`;
@@ -264,6 +274,7 @@ router.get("/my", auth, async (req, res) => {
                 c.is_active,
                 c.created_at,
                 c.updated_at,
+                c.is_archive,
 
                 u.first_name,
                 u.last_name,
@@ -343,6 +354,7 @@ router.get("/published", async (req, res) => {
             WHERE c.status = 'published'
             AND c.is_active = 1
             AND c.deleted_at IS NULL
+            AND c.is_archive = 0
         `;
 
         const params = [];
@@ -441,6 +453,242 @@ router.get("/published", async (req, res) => {
         );
     }
 });
+
+/* ============================================================
+   3.5️⃣ GET ALL COURSES (published / unpublished by default,
+        + draft for admin-created courses)
+   ------------------------------------------------------------
+   @route   GET /api/educator/courses/all
+   @desc    By default, returns only published & unpublished courses.
+            Courses created by admin (is_created_by_admin = 1) also
+            surface their draft entries. Pass ?status=xyz to override
+            and filter by an exact status instead. Pass ?id=123 to
+            fetch just that one course instead of the full list
+            (with chapters included).
+   @access  Private (Admin / Super Admin)
+   @query   id, page, limit, status, is_archive, educator_id, is_created_by_admin,
+            search, sortBy, sortOrder
+============================================================ */
+router.get("/all", auth, async (req, res) => {
+    try {
+        const mysql = getMySQLConnection();
+
+        const isAdmin = ["admin", "superadmin"].includes(req.user.user_type);
+        if (!isAdmin) {
+            return errorResponse(res, "Only admins can view all courses", 403);
+        }
+
+        const { id } = req.query;
+
+        // ── Single course fetch (id passed in query) ───────────────────────
+        if (id) {
+            const [[course]] = await mysql.execute(
+                `SELECT
+                    c.*,
+                    u.first_name AS educator_first_name,
+                    u.last_name  AS educator_last_name,
+                    u.email      AS educator_email,
+                    u.avatar     AS educator_avatar
+                 FROM courses c
+                 LEFT JOIN users u ON c.educator_id = u.id
+                 WHERE c.id = ? AND c.deleted_at IS NULL
+                 LIMIT 1`,
+                [id]
+            );
+
+            if (!course) {
+                return errorResponse(res, "Course not found", 404);
+            }
+
+            const [chapters] = await mysql.execute(
+                `SELECT ch.*, COUNT(cl.id) AS lesson_count
+                 FROM course_chapters ch
+                 LEFT JOIN course_lessons cl ON cl.chapter_id = ch.id AND cl.is_active = 1
+                 WHERE ch.course_id = ?
+                 GROUP BY ch.id
+                 ORDER BY ch.chapter_order ASC`,
+                [id]
+            );
+
+            return successResponse(
+                res,
+                { ...formatCourse(course), chapters },
+                "Course fetched successfully"
+            );
+        }
+
+        // ── Full list (every status, archived + unarchived) ────────────────
+        let {
+            page = 1,
+            limit = 20,
+            status,
+            is_archive,
+            educator_id,
+            is_created_by_admin,
+            search,
+            sortBy = "created_at",
+            sortOrder = "desc",
+        } = req.query;
+
+        page = parseInt(page, 10) || 1;
+        limit = parseInt(limit, 10) || 20;
+        if (page < 1) page = 1;
+        if (limit < 1) limit = 20;
+
+        const offset = (page - 1) * limit;
+
+        // =============================
+        // SORT MAP
+        // =============================
+        const sortColumnMap = {
+            course_title: "c.course_title",
+            id: "c.id",
+            educator: "CONCAT(u.first_name, ' ', u.last_name)",
+            category: "c.category",
+            subcategory: "c.subcategory",
+            course_type: "c.course_type",
+            price: "c.price",
+            level: "c.level",
+            language: "c.language",
+            status: "c.status",
+            total_students: "c.total_students",
+            total_chapters: "c.total_chapters",
+            total_lessons: "c.total_lessons",
+            published_at: "c.published_at",
+            created_at: "c.created_at",
+            updated_at: "c.updated_at",
+        };
+
+        const orderDirection = sortOrder === "asc" ? "ASC" : "DESC";
+        const orderByColumn = sortColumnMap[sortBy] || "c.created_at";
+        const finalOrderQuery = `${orderByColumn} ${orderDirection}`;
+
+        // Default (no ?status passed): only published / unpublished courses
+        // come back. Exception — if a course was created by admin
+        // (is_created_by_admin = 1), its draft courses are included too.
+        // If ?status is passed explicitly, that exact status is used instead.
+        const where = ["c.deleted_at IS NULL"];
+        const params = [];
+
+        if (status) {
+            where.push("c.status = ?");
+            params.push(status);
+        } else {
+            where.push(
+                "(c.status IN ('published', 'unpublished') OR (c.is_created_by_admin = 1 AND c.status = 'draft'))"
+            );
+        }
+        if (is_archive !== undefined) {
+            where.push("c.is_archive = ?");
+            params.push(is_archive === "true" || is_archive === "1" ? 1 : 0);
+        }
+        if (educator_id) {
+            where.push("c.educator_id = ?");
+            params.push(educator_id);
+        }
+        if (is_created_by_admin !== undefined) {
+            where.push("c.is_created_by_admin = ?");
+            params.push(is_created_by_admin === "true" || is_created_by_admin === "1" ? 1 : 0);
+        }
+
+        // ✅ Search — ignore punctuation, match any keyword against
+        // course title, category, subcategory, or educator name
+        if (search) {
+            const cleanSearch = search.replace(/[.,\/#!$%\^&\*;:{}=\-_`~()?"'’]/g, " ");
+            const keywords = cleanSearch.split(/\s+/).filter(Boolean);
+            const uniqueKeywords = [...new Set(keywords)];
+
+            uniqueKeywords.forEach((keyword) => {
+                where.push(`
+                    (
+                        c.course_title LIKE ?
+                        OR c.category LIKE ?
+                        OR c.subcategory LIKE ?
+                        OR u.first_name LIKE ?
+                        OR u.last_name LIKE ?
+                        OR CONCAT(u.first_name, ' ', u.last_name) LIKE ?
+                    )
+                `);
+                const like = `%${keyword}%`;
+                params.push(like, like, like, like, like, like);
+            });
+        }
+
+        const whereClause = `WHERE ${where.join(" AND ")}`;
+
+        const [courses] = await mysql.execute(
+            `
+            SELECT
+                c.id,
+                c.course_title,
+                c.slug,
+                c.short_description,
+                c.category,
+                c.subcategory,
+                c.thumbnail,
+                c.course_type,
+                c.price,
+                c.currency,
+                c.language,
+                c.level,
+                c.visibility,
+                c.status,
+                c.is_archive,
+                c.is_active,
+                c.is_featured,
+                c.total_chapters,
+                c.total_lessons,
+                c.total_students,
+                c.published_at,
+                c.created_at,
+                c.updated_at,
+
+                u.id AS educator_id,
+                u.first_name AS educator_first_name,
+                u.last_name AS educator_last_name,
+                u.email AS educator_email,
+                u.avatar AS educator_avatar
+
+            FROM courses c
+            LEFT JOIN users u
+                ON u.id = c.educator_id
+
+            ${whereClause}
+
+            ORDER BY ${finalOrderQuery}
+            LIMIT ? OFFSET ?
+            `,
+            [...params, limit, offset]
+        );
+
+        const [[count]] = await mysql.execute(
+            `SELECT COUNT(*) AS total FROM courses c LEFT JOIN users u ON u.id = c.educator_id ${whereClause}`,
+            params
+        );
+
+        return successResponse(
+            res,
+            {
+                courses,
+                pagination: {
+                    page,
+                    limit,
+                    total: count.total,
+                    totalPages: Math.ceil(count.total / limit),
+                },
+                sorting: {
+                    sortBy,
+                    sortOrder: orderDirection,
+                },
+            },
+            "All courses fetched successfully"
+        );
+    } catch (error) {
+        console.error("Get All Courses Error:", error);
+        return errorResponse(res, error.message || "Internal Server Error", 500);
+    }
+});
+
 /* ============================================================
    4️⃣ GET SINGLE COURSE
    ------------------------------------------------------------
@@ -524,7 +772,7 @@ router.put("/:id", auth, courseThumbnailUpload.single("thumbnail"), async (req, 
         }
 
         /* Educators cannot update if pending review, rejected-pending-decision, or already published */
-        const lockedStatuses = ["proposal_submitted", "proposal_rejected", "submitted_for_review", "approved", "published"];
+        const lockedStatuses = ["proposal_submitted", "proposal_rejected", "submitted_for_review", "approved", "published", "unpublished"];
         if (!isAdmin && lockedStatuses.includes(course.status)) {
             return errorResponse(res, `Cannot update course with status: ${course.status}`, 400);
         }
@@ -547,8 +795,62 @@ router.put("/:id", auth, courseThumbnailUpload.single("thumbnail"), async (req, 
             currency,
             promo_video_url,
             visibility,
-            completion_required_percentage
+            completion_required_percentage,
+            status,
+            is_archive,
+            is_active,
+            is_featured
         } = req.body;
+
+        /* ── Status validation / permission ──────────────────────────────── */
+        const ALLOWED_STATUSES = [
+            "draft",
+            "in_development",
+            "proposal_submitted",
+            "proposal_rejected",
+            "submitted_for_review",
+            "revision_requested",
+            "approved",
+            "rejected",
+            "published",
+            "unpublished"
+        ];
+
+        // Statuses only an admin/superadmin is allowed to set directly
+        const ADMIN_ONLY_STATUSES = ["approved", "rejected", "published", "proposal_rejected", "unpublished"];
+
+        let newStatus = course.status;
+        if (status !== undefined) {
+            if (!ALLOWED_STATUSES.includes(status)) {
+                return errorResponse(
+                    res,
+                    `Invalid status. Allowed values: ${ALLOWED_STATUSES.join(", ")}`,
+                    400
+                );
+            }
+            if (!isAdmin && ADMIN_ONLY_STATUSES.includes(status)) {
+                return errorResponse(
+                    res,
+                    `Only admins can set status to '${status}'`,
+                    403
+                );
+            }
+            newStatus = status;
+        }
+
+        // is_archive / is_active / is_featured — admin-controlled flags
+        if ((is_archive !== undefined || is_active !== undefined || is_featured !== undefined) && !isAdmin) {
+            return errorResponse(res, "Only admins can update archive/active/featured flags", 403);
+        }
+
+        const toBool = (val, fallback) => {
+            if (val === undefined) return fallback;
+            return val === true || val === "true" || val === 1 || val === "1" ? 1 : 0;
+        };
+
+        const newIsArchive = toBool(is_archive, course.is_archive);
+        const newIsActive = toBool(is_active, course.is_active);
+        const newIsFeatured = toBool(is_featured, course.is_featured);
 
         let slug = course.slug;
 
@@ -585,6 +887,9 @@ router.put("/:id", auth, courseThumbnailUpload.single("thumbnail"), async (req, 
             return JSON.stringify(field);
         };
 
+        // published_at: set the first time a course transitions to 'published'
+        const shouldSetPublishedAt = newStatus === "published" && course.status !== "published";
+
         await mysql.execute(
             `UPDATE courses SET
             course_title = ?,
@@ -606,7 +911,12 @@ router.put("/:id", auth, courseThumbnailUpload.single("thumbnail"), async (req, 
             thumbnail = ?,
             promo_video_url = ?,
             visibility = ?,
-            completion_required_percentage = ?
+            completion_required_percentage = ?,
+            status = ?,
+            is_archive = ?,
+            is_active = ?,
+            is_featured = ?
+            ${shouldSetPublishedAt ? ", published_at = NOW()" : ""}
          WHERE id = ?`,
             [
                 course_title || course.course_title,
@@ -631,9 +941,36 @@ router.put("/:id", auth, courseThumbnailUpload.single("thumbnail"), async (req, 
                 promo_video_url ?? course.promo_video_url,
                 visibility || course.visibility,
                 completion_required_percentage ?? course.completion_required_percentage,
+                newStatus,
+                newIsArchive,
+                newIsActive,
+                newIsFeatured,
                 id
             ]
         );
+
+        // Log status change history + notify educator (non-blocking)
+        if (newStatus !== course.status) {
+            try {
+                await mysql.execute(
+                    `INSERT INTO course_status_history (course_id, old_status, new_status, changed_by, remarks)
+                     VALUES (?, ?, ?, ?, ?)`,
+                    [id, course.status, newStatus, req.user.id, req.body.status_remarks || null]
+                );
+            } catch (logErr) {
+                console.error("Status history log error:", logErr);
+            }
+
+            sendEducatorNotification({
+                mysql,
+                event: EDUCATOR_NOTIFICATION_EVENTS.COURSE_STATUS_UPDATED
+                    || EDUCATOR_NOTIFICATION_EVENTS.COURSE_SUBMITTED_FOR_REVIEW,
+                userId: course.educator_id,
+                actorId: req.user.id,
+                data: { courseTitle: course.course_title, oldStatus: course.status, newStatus },
+                metadata: { course_id: parseInt(id) }
+            });
+        }
 
         const [[updatedCourse]] = await mysql.execute(
             `SELECT * FROM courses WHERE id = ? LIMIT 1`,

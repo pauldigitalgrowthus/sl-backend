@@ -3,6 +3,152 @@ const { getMySQLConnection } = require('../config/mysql');
 const { auth } = require('../middleware/auth');
 const { successResponse, errorResponse } = require('../utils/response');
 const { communityMusicLibraryUpload, deleteFileFromS3 } = require('../config/s3');
+const { pdfToPng } = require("pdf-to-png-converter");
+const sharp = require("sharp");
+const fs = require("fs");
+const path = require("path");
+const https = require("https");
+const http = require("http");
+const { PutObjectCommand } = require("@aws-sdk/client-s3");
+const { s3: s3Client, BUCKET_NAME } = require("../config/s3");
+
+const downloadFile = (url, destination) => {
+  return new Promise((resolve, reject) => {
+    const protocol = url.startsWith("https:") ? https : http;
+
+    const file = fs.createWriteStream(destination);
+
+    protocol
+      .get(url, (response) => {
+        // Follow redirects (S3 can 301/302 redirect between region endpoints)
+        if (
+          [301, 302, 303, 307, 308].includes(response.statusCode) &&
+          response.headers.location
+        ) {
+          response.resume(); // discard this response body
+          return downloadFile(response.headers.location, destination)
+            .then(resolve)
+            .catch(reject);
+        }
+
+        if (response.statusCode !== 200) {
+          // Drain the body so we can log what S3 actually said (e.g. AccessDenied XML)
+          let body = "";
+          response.on("data", (chunk) => (body += chunk));
+          response.on("end", () => {
+            fs.unlink(destination, () => {});
+            reject(
+              new Error(
+                `Failed to download file. Status: ${response.statusCode}. Body: ${body.slice(0, 300)}`
+              )
+            );
+          });
+          return;
+        }
+
+        response.pipe(file);
+
+        file.on("finish", () => {
+          file.close(resolve);
+        });
+      })
+      .on("error", (err) => {
+        fs.unlink(destination, () => {});
+        reject(err);
+      });
+  });
+};
+
+async function generatePdfThumbnail(pdfUrl, originalName) {
+  const thumbnailsDir = path.join(
+    process.cwd(),
+    "temp",
+    `thumb-${Date.now()}`
+  );
+
+  fs.mkdirSync(thumbnailsDir, { recursive: true });
+
+  const safeOriginalName = path.basename(originalName);
+  const baseName = path.parse(safeOriginalName).name;
+
+  const tempPdfPath = path.join(
+    thumbnailsDir,
+    `temp_${Date.now()}_${safeOriginalName}`
+  );
+
+  try {
+    await downloadFile(pdfUrl, tempPdfPath);
+
+    const pngPages = await pdfToPng(tempPdfPath, {
+      viewportScale: 3,
+      outputFolder: path.relative(process.cwd(), thumbnailsDir),
+      pagesToProcess: [1],
+      outputFileMask: `${baseName}_${Date.now()}`
+    });
+
+    if (!pngPages.length) return null;
+
+    const firstPage = pngPages[0].path;
+
+    const thumbName = `${baseName}_${Date.now()}_thumb.png`;
+    const thumbPath = path.join(thumbnailsDir, thumbName);
+
+    await sharp(firstPage)
+      .resize(800, 800, {
+        fit: "inside",
+        withoutEnlargement: true
+      })
+      .png()
+      .toFile(thumbPath);
+
+    const thumbnailUrl = await uploadThumbnailToS3(
+      thumbPath,
+      thumbName
+    );
+
+    fs.rmSync(thumbnailsDir, {
+      recursive: true,
+      force: true
+    });
+
+    return thumbnailUrl;
+  } catch (err) {
+    console.error(`PDF thumbnail generation failed for "${originalName}":`, err);
+    fs.rmSync(thumbnailsDir, {
+      recursive: true,
+      force: true
+    });
+    // Re-throw (instead of swallowing to null) so the calling route can
+    // capture the real reason in a thumbnailError field on the response,
+    // the same way music-publications.js does.
+    throw err;
+  }
+}
+
+// Helper function to upload a generated PDF thumbnail to S3 using AWS SDK v3
+async function uploadThumbnailToS3(localFilePath, fileName) {
+  try {
+    const fileBuffer = fs.readFileSync(localFilePath);
+
+    const uploadParams = {
+      Bucket: BUCKET_NAME,
+      Key: `community-music-library/thumbnails/${fileName}`,
+      Body: fileBuffer,
+      ContentType: "image/png",
+    };
+
+    const command = new PutObjectCommand(uploadParams);
+    await s3Client.send(command);
+
+    const s3Url = `https://${BUCKET_NAME}.s3.${process.env.AWS_REGION || "ap-south-1"}.amazonaws.com/community-music-library/thumbnails/${fileName}`;
+
+    console.log("Thumbnail uploaded to S3:", s3Url);
+    return s3Url;
+  } catch (error) {
+    console.error("S3 thumbnail upload error:", error);
+    throw error;
+  }
+}
 
 const router = express.Router();
 
@@ -469,22 +615,46 @@ router.post(
         parsedPdfMeta = JSON.parse(pdfFilesMeta);
       }
 
-      const pdfFiles = req.files?.pdfFiles
-        ? req.files.pdfFiles.map((file, index) => {
-          const meta = parsedPdfMeta[index] || {};
-          return {
-            designation: meta.designation || '',
-            instruments: meta.instruments || [],
-            customInstrument: meta.customInstrument || '',
-            file: {
-              url: file.location,
-              size: file.size,
-              name: file.originalname,
-              type: file.mimetype
-            }
-          };
-        })
-        : [];
+const pdfFiles = req.files?.pdfFiles
+  ? await Promise.all(
+      req.files.pdfFiles.map(async (file, index) => {
+        const meta = parsedPdfMeta[index] || {};
+
+        let thumbnailUrl = null;
+        let thumbnailGenerated = false;
+        let thumbnailError = null;
+
+        if (file.mimetype === "application/pdf") {
+          try {
+            thumbnailUrl = await generatePdfThumbnail(
+              file.location,
+              file.originalname
+            );
+            thumbnailGenerated = true;
+          } catch (err) {
+            console.error("Thumbnail generation failed:", err);
+            thumbnailGenerated = false;
+            thumbnailError = err.message;
+          }
+        }
+
+        return {
+          designation: meta.designation || "",
+          instruments: meta.instruments || [],
+          customInstrument: meta.customInstrument || "",
+          thumbnailUrl,
+          thumbnailGenerated,
+          thumbnailError,
+          file: {
+            url: file.location,
+            size: file.size,
+            name: file.originalname,
+            type: file.mimetype,
+          },
+        };
+      })
+    )
+  : [];
 
       /* --------------------------------------------------
          MP3 & IMAGE (UNCHANGED)
@@ -615,7 +785,10 @@ router.put('/:id', [
         tags,
         notes,
         musicType,
-        pdfFilesMeta
+        pdfFilesMeta,
+        existingPdfFiles,
+        existingMp3Files,
+        existingImageFiles
       } = req.body;
 
       const parentUserId = getParentUserId(req.user);
@@ -685,80 +858,178 @@ router.put('/:id', [
       }
 
       /* --------------------------------------------------
-         PDF FILES (WITH META – SAME AS CREATE)
+         PDF FILES
+         - Existing PDFs are KEPT by default.
+         - They are only removed if the client explicitly sends
+           `existingPdfFiles` WITHOUT that file in it (i.e. user
+           deleted it from the UI).
+         - Newly uploaded PDFs are appended, each with a freshly
+           generated thumbnail (same logic as add-non-sl-music).
       -------------------------------------------------- */
-      if (req.files?.pdfFiles) {
-        // delete old PDFs
+      if (req.files?.pdfFiles || existingPdfFiles !== undefined) {
         const oldPdfFiles = parseJsonSafe(music.pdf_files, []);
-        for (const old of oldPdfFiles) {
-          if (old?.file?.url || old?.url) {
-            await deleteFileFromS3(old.file?.url || old.url).catch(() => { });
+
+        // What the client wants to keep from the old list.
+        // If the client didn't send this field at all, default to
+        // keeping everything (so old files are never silently dropped).
+        let keepPdfFiles = oldPdfFiles;
+        if (existingPdfFiles !== undefined) {
+          try {
+            keepPdfFiles =
+              typeof existingPdfFiles === 'string'
+                ? JSON.parse(existingPdfFiles)
+                : existingPdfFiles;
+          } catch {
+            keepPdfFiles = oldPdfFiles;
           }
         }
 
-        const parsedMeta = pdfFilesMeta ? JSON.parse(pdfFilesMeta) : {};
+        // Only delete from S3 the files that existed before but are
+        // NOT in the keep list anymore — i.e. explicitly removed.
+        const keepPdfUrls = new Set(
+          keepPdfFiles.map((f) => f?.file?.url || f?.url).filter(Boolean)
+        );
+        for (const old of oldPdfFiles) {
+          const oldUrl = old?.file?.url || old?.url;
+          if (oldUrl && !keepPdfUrls.has(oldUrl)) {
+            await deleteFileFromS3(oldUrl).catch(() => { });
+          }
+        }
 
-        const pdfFiles = req.files.pdfFiles.map((file, index) => {
-          const meta = parsedMeta[index] || {};
-          return {
-            designation: meta.designation || '',
-            instruments: meta.instruments || [],
-            customInstrument: meta.customInstrument || '',
-            file: {
+        // Generate thumbnails for newly uploaded PDFs only
+        let newPdfFiles = [];
+        if (req.files?.pdfFiles) {
+          const parsedMeta = pdfFilesMeta ? JSON.parse(pdfFilesMeta) : {};
+
+          newPdfFiles = await Promise.all(
+            req.files.pdfFiles.map(async (file, index) => {
+              const meta = parsedMeta[index] || {};
+
+              let thumbnailUrl = null;
+              let thumbnailGenerated = false;
+              let thumbnailError = null;
+              if (file.mimetype === 'application/pdf') {
+                try {
+                  thumbnailUrl = await generatePdfThumbnail(
+                    file.location,
+                    file.originalname
+                  );
+                  thumbnailGenerated = true;
+                } catch (err) {
+                  console.error('Thumbnail generation failed:', err);
+                  thumbnailGenerated = false;
+                  thumbnailError = err.message;
+                }
+              }
+
+              return {
+                designation: meta.designation || '',
+                instruments: meta.instruments || [],
+                customInstrument: meta.customInstrument || '',
+                thumbnailUrl,
+                thumbnailGenerated,
+                thumbnailError,
+                file: {
+                  url: file.location,
+                  size: file.size,
+                  name: file.originalname,
+                  type: file.mimetype
+                }
+              };
+            })
+          );
+        }
+
+        const finalPdfFiles = [...keepPdfFiles, ...newPdfFiles];
+
+        updateFields.push('pdf_files = ?');
+        updateValues.push(stringifyJsonSafe(finalPdfFiles));
+      }
+
+      /* --------------------------------------------------
+         MP3 FILES
+         - Same keep/remove behaviour as PDFs, via `existingMp3Files`.
+      -------------------------------------------------- */
+      if (req.files?.mp3Files || existingMp3Files !== undefined) {
+        const oldMp3Files = parseJsonSafe(music.mp3_files, []);
+
+        let keepMp3Files = oldMp3Files;
+        if (existingMp3Files !== undefined) {
+          try {
+            keepMp3Files =
+              typeof existingMp3Files === 'string'
+                ? JSON.parse(existingMp3Files)
+                : existingMp3Files;
+          } catch {
+            keepMp3Files = oldMp3Files;
+          }
+        }
+
+        const keepMp3Urls = new Set(
+          keepMp3Files.map((f) => f?.url).filter(Boolean)
+        );
+        for (const old of oldMp3Files) {
+          if (old?.url && !keepMp3Urls.has(old.url)) {
+            await deleteFileFromS3(old.url).catch(() => { });
+          }
+        }
+
+        const newMp3Files = req.files?.mp3Files
+          ? req.files.mp3Files.map((file) => ({
               url: file.location,
               size: file.size,
               name: file.originalname,
               type: file.mimetype
-            }
-          };
-        });
+            }))
+          : [];
 
-        updateFields.push('pdf_files = ?');
-        updateValues.push(stringifyJsonSafe(pdfFiles));
-      }
-
-      /* --------------------------------------------------
-         MP3 FILES (UNCHANGED)
-      -------------------------------------------------- */
-      if (req.files?.mp3Files) {
-        const oldMp3Files = parseJsonSafe(music.mp3_files, []);
-        for (const old of oldMp3Files) {
-          if (old?.url) {
-            await deleteFileFromS3(old.url).catch(() => { });
-          }
-        }
-
-        const mp3Files = req.files.mp3Files.map(file => ({
-          url: file.location,
-          size: file.size,
-          name: file.originalname,
-          type: file.mimetype
-        }));
+        const finalMp3Files = [...keepMp3Files, ...newMp3Files];
 
         updateFields.push('mp3_files = ?');
-        updateValues.push(stringifyJsonSafe(mp3Files));
+        updateValues.push(stringifyJsonSafe(finalMp3Files));
       }
 
       /* --------------------------------------------------
-         IMAGE FILES (UNCHANGED)
+         IMAGE FILES
+         - Same keep/remove behaviour as PDFs, via `existingImageFiles`.
       -------------------------------------------------- */
-      if (req.files?.imageFiles) {
+      if (req.files?.imageFiles || existingImageFiles !== undefined) {
         const oldImages = parseJsonSafe(music.image_files, []);
+
+        let keepImageFiles = oldImages;
+        if (existingImageFiles !== undefined) {
+          try {
+            keepImageFiles =
+              typeof existingImageFiles === 'string'
+                ? JSON.parse(existingImageFiles)
+                : existingImageFiles;
+          } catch {
+            keepImageFiles = oldImages;
+          }
+        }
+
+        const keepImageUrls = new Set(
+          keepImageFiles.map((f) => f?.url).filter(Boolean)
+        );
         for (const old of oldImages) {
-          if (old?.url) {
+          if (old?.url && !keepImageUrls.has(old.url)) {
             await deleteFileFromS3(old.url).catch(() => { });
           }
         }
 
-        const imageFiles = req.files.imageFiles.map(file => ({
-          url: file.location,
-          size: file.size,
-          name: file.originalname,
-          type: file.mimetype
-        }));
+        const newImageFiles = req.files?.imageFiles
+          ? req.files.imageFiles.map((file) => ({
+              url: file.location,
+              size: file.size,
+              name: file.originalname,
+              type: file.mimetype
+            }))
+          : [];
+
+        const finalImageFiles = [...keepImageFiles, ...newImageFiles];
 
         updateFields.push('image_files = ?');
-        updateValues.push(stringifyJsonSafe(imageFiles));
+        updateValues.push(stringifyJsonSafe(finalImageFiles));
       }
 
       if (!updateFields.length) {
@@ -1626,4 +1897,3 @@ router.get('/:id', auth, async (req, res) => {
 });
 
 module.exports = router;
-

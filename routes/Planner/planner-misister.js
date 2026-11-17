@@ -171,25 +171,65 @@ router.post("/", auth, async (req, res) => {
 
     if (mappedUserType === "sub_user") {
 
-      childPlanPermissions = {};
+      let freePermissions = {};
+      try {
+        const [[freePlan]] = await connection.execute(
+          `SELECT id FROM plans WHERE slug = 'free-account' LIMIT 1`
+        );
+        if (freePlan) {
+          const [freeFeatures] = await connection.execute(
+            `SELECT 
+              f.name AS feature_name,
+              f.category,
+              pt.name AS permission_type,
+              pf.custom_value
+             FROM plan_features pf
+             JOIN features f ON pf.feature_id = f.id
+             JOIN permission_types pt ON pf.permission_type_id = pt.id
+             WHERE pf.plan_id = ? AND f.is_active = TRUE`,
+            [freePlan.id]
+          );
 
-      // MUSIC
-      if (planPermissions?.Music?.["My Music"]) {
-
-        childPlanPermissions.Music = {
-          "My Music": planPermissions.Music["My Music"]
-        };
-
+          freeFeatures.forEach(feature => {
+            if (!freePermissions[feature.category]) {
+              freePermissions[feature.category] = {};
+            }
+            if (feature.permission_type === 'custom' || feature.permission_type === 'access-level') {
+              freePermissions[feature.category][feature.feature_name] = {
+                type: feature.permission_type,
+                limit: Number(feature.custom_value) || 0,
+                used: 0
+              };
+            } else {
+              freePermissions[feature.category][feature.feature_name] = feature.permission_type;
+            }
+          });
+        }
+      } catch (dbErr) {
+        console.error("Error fetching free plan permissions:", dbErr);
       }
 
-      // PLANNER
-      if (planPermissions?.Planner?.["My Planner"]) {
+      childPlanPermissions = JSON.parse(JSON.stringify(freePermissions));
+      delete childPlanPermissions["Member Limit"];
 
-        childPlanPermissions.Planner = {
-          "My Planner": planPermissions.Planner["My Planner"]
-        };
-
-      }
+      // Full access to Community for Member/sub_user
+      childPlanPermissions["Community"] = {
+        "Feed": "x",
+        "Feeds": "x",
+        "Discussions": "x",
+        "My Groups": "x",
+        "Groups": "x",
+        "Prayer": "x"
+      };
+      if (!childPlanPermissions["SL Portals"]) childPlanPermissions["SL Portals"] = {};
+      childPlanPermissions["SL Portals"]["Community"] = {
+        "Feed": "x",
+        "Feeds": "x",
+        "Discussions": "x",
+        "My Groups": "x",
+        "Groups": "x",
+        "Prayer": "x"
+      };
 
       // SL ACCOUNT
       if (planPermissions?.["SL Account"]) {
@@ -206,6 +246,8 @@ router.post("/", auth, async (req, res) => {
             planPermissions["SL Account"]["My Ministers"];
         }
 
+      } else {
+        delete childPlanPermissions["SL Account"];
       }
 
     }
@@ -968,7 +1010,13 @@ router.post('/:id/enable-login', auth, async (req, res) => {
     const lastName = rest.join(' ') || '';
 
     // =========================
-    // 🔹 INHERIT PLAN PERMISSIONS
+    // 🔹 USER TYPE MAP
+    // =========================
+    const userType =
+      minister.user_type === 'Manager' ? 'manager' : 'sub_user';
+
+    // =========================
+    // 🔹 BUILD CHILD PERMISSIONS
     // =========================
     let planPermissions = parentUser.plan_permissions;
 
@@ -976,13 +1024,121 @@ router.post('/:id/enable-login', auth, async (req, res) => {
       planPermissions = JSON.parse(planPermissions);
     }
 
-    const inheritedPermissions = planPermissions || null;
+    let childPlanPermissions = {};
 
-    // =========================
-    // 🔹 USER TYPE MAP
-    // =========================
-    const userType =
-      minister.user_type === 'Manager' ? 'manager' : 'sub_user';
+    if (userType === "manager") {
+
+      childPlanPermissions = JSON.parse(JSON.stringify(planPermissions));
+
+      if (childPlanPermissions["SL Account"]) {
+
+        delete childPlanPermissions["SL Account"]["Manage Plan (Upgrade)"];
+        delete childPlanPermissions["SL Account"]["Agreements"];
+
+      }
+
+      childPlanPermissions["Community"] = {
+        "Feed": "x",
+        "Feeds": "x",
+        "Discussions": "x",
+        "My Groups": "x",
+        "Groups": "x",
+        "Prayer": "x"
+      };
+      if (!childPlanPermissions["SL Portals"]) childPlanPermissions["SL Portals"] = {};
+      childPlanPermissions["SL Portals"]["Community"] = {
+        "Feed": "x",
+        "Feeds": "x",
+        "Discussions": "x",
+        "My Groups": "x",
+        "Groups": "x",
+        "Prayer": "x"
+      };
+
+    }
+
+    if (userType === "sub_user") {
+
+      let freePermissions = {};
+      try {
+        const [[freePlan]] = await mysqlConnection.execute(
+          `SELECT id FROM plans WHERE slug = 'free-account' LIMIT 1`
+        );
+        if (freePlan) {
+          const [freeFeatures] = await mysqlConnection.execute(
+            `SELECT 
+              f.name AS feature_name,
+              f.category,
+              pt.name AS permission_type,
+              pf.custom_value
+             FROM plan_features pf
+             JOIN features f ON pf.feature_id = f.id
+             JOIN permission_types pt ON pf.permission_type_id = pt.id
+             WHERE pf.plan_id = ? AND f.is_active = TRUE`,
+            [freePlan.id]
+          );
+
+          freeFeatures.forEach(feature => {
+            if (!freePermissions[feature.category]) {
+              freePermissions[feature.category] = {};
+            }
+            if (feature.permission_type === 'custom' || feature.permission_type === 'access-level') {
+              freePermissions[feature.category][feature.feature_name] = {
+                type: feature.permission_type,
+                limit: Number(feature.custom_value) || 0,
+                used: 0
+              };
+            } else {
+              freePermissions[feature.category][feature.feature_name] = feature.permission_type;
+            }
+          });
+        }
+      } catch (dbErr) {
+        console.error("Error fetching free plan permissions:", dbErr);
+      }
+
+      childPlanPermissions = JSON.parse(JSON.stringify(freePermissions));
+      delete childPlanPermissions["Member Limit"];
+
+      // Full access to Community for Member/sub_user
+      childPlanPermissions["Community"] = {
+        "Feed": "x",
+        "Feeds": "x",
+        "Discussions": "x",
+        "My Groups": "x",
+        "Groups": "x",
+        "Prayer": "x"
+      };
+      if (!childPlanPermissions["SL Portals"]) childPlanPermissions["SL Portals"] = {};
+      childPlanPermissions["SL Portals"]["Community"] = {
+        "Feed": "x",
+        "Feeds": "x",
+        "Discussions": "x",
+        "My Groups": "x",
+        "Groups": "x",
+        "Prayer": "x"
+      };
+
+      // SL ACCOUNT
+      if (planPermissions?.["SL Account"]) {
+
+        childPlanPermissions["SL Account"] = {};
+
+        if (planPermissions["SL Account"]["My Profile"]) {
+          childPlanPermissions["SL Account"]["My Profile"] =
+            planPermissions["SL Account"]["My Profile"];
+        }
+
+        if (planPermissions["SL Account"]["My Ministers"]) {
+          childPlanPermissions["SL Account"]["My Ministers"] =
+            planPermissions["SL Account"]["My Ministers"];
+        }
+
+      } else {
+        delete childPlanPermissions["SL Account"];
+      }
+
+    }
 
     // =========================
     // 🔹 CREATE USER
@@ -1011,9 +1167,7 @@ router.post('/:id/enable-login', auth, async (req, res) => {
         minister.phone || null,
         userType,
         minister.parent_user_id,
-        inheritedPermissions
-          ? JSON.stringify(inheritedPermissions)
-          : null
+        JSON.stringify(childPlanPermissions)
       ]
     );
 

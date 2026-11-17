@@ -352,7 +352,8 @@ router.post('/', async (req, res) => {
             gospel_description,
             usccb_url,
             notes,
-            metadata
+            metadata,
+            attached_mass_template
         } = req.body;
 
         const mysqlConnection = getMySQLConnection();
@@ -403,8 +404,9 @@ router.post('/', async (req, res) => {
                 notes,
                 metadata,
                 created_at,
-                updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP())`,
+                updated_at,
+                attached_mass_template
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, UTC_TIMESTAMP(), UTC_TIMESTAMP(), ?)`,
             [
                 event_title,
                 normalizedDate,
@@ -424,7 +426,8 @@ router.post('/', async (req, res) => {
                 gospel_description || null,
                 usccb_url || null,
                 notes || null,
-                JSON.stringify(metadata || {})
+                JSON.stringify(metadata || {}),
+                attached_mass_template ? JSON.stringify(attached_mass_template) : null
             ]
         );
 
@@ -637,7 +640,8 @@ router.get('/', async (req, res) => {
                 metadata,
                 liturgical_songs,
                 created_at,
-                updated_at
+                updated_at,
+                attached_mass_template
             FROM liturgical_events
             ${whereClause}
             ORDER BY calendar_date ASC, id ASC
@@ -653,6 +657,7 @@ router.get('/', async (req, res) => {
         const [rows] = await mysqlConnection.execute(fetchQuery, queryValues);
         const parseJSON = rows.map(row => {
             row.liturgical_songs = row.liturgical_songs ? JSON.parse(row.liturgical_songs) : [];
+            row.attached_mass_template = row.attached_mass_template ? JSON.parse(row.attached_mass_template) : null;
             return row;
         });
 
@@ -719,7 +724,8 @@ router.get('/:id', async (req, res) => {
                 metadata,
                 liturgical_songs,
                 created_at,
-                updated_at
+                updated_at,
+                attached_mass_template
             FROM liturgical_events
             WHERE id = ?`,
             [eventId]
@@ -746,6 +752,14 @@ router.get('/:id', async (req, res) => {
                 : [];
         } catch {
             event.liturgical_songs = [];
+        }
+
+        try {
+            event.attached_mass_template = event.attached_mass_template
+                ? JSON.parse(event.attached_mass_template)
+                : null;
+        } catch {
+            event.attached_mass_template = null;
         }
 
         /* --------------------------------------------------
@@ -826,6 +840,7 @@ router.put('/:id', async (req, res) => {
             notes = ?,
             metadata = ?,
             liturgical_songs = ?,
+            attached_mass_template = ?,
             updated_at = UTC_TIMESTAMP()
          WHERE id = ?`,
             [
@@ -849,6 +864,9 @@ router.put('/:id', async (req, res) => {
                 body.notes ?? existing.notes,
                 JSON.stringify(body.metadata ?? JSON.parse(existing.metadata || '{}')),
                 JSON.stringify(body.liturgical_songs ?? JSON.parse(existing.liturgical_songs || '[]')),
+                body.attached_mass_template !== undefined
+                    ? (body.attached_mass_template ? JSON.stringify(body.attached_mass_template) : null)
+                    : existing.attached_mass_template,
                 eventId
             ]
         );
@@ -880,13 +898,15 @@ router.put('/:id', async (req, res) => {
             metadata,
             liturgical_songs,
             created_at,
-            updated_at
+            updated_at,
+            attached_mass_template
          FROM liturgical_events
          WHERE id = ?`,
             [eventId]
         );
         updatedRows[0].liturgical_songs = updatedRows[0].liturgical_songs ? JSON.parse(updatedRows[0].liturgical_songs) : [];
         updatedRows[0].metadata = updatedRows[0].metadata ? JSON.parse(updatedRows[0].metadata) : {};
+        updatedRows[0].attached_mass_template = updatedRows[0].attached_mass_template ? JSON.parse(updatedRows[0].attached_mass_template) : null;
 
         return successResponse(
             res,

@@ -6,7 +6,7 @@ const { successResponse, errorResponse } = require("../../utils/response");
 const {
     sendEducatorNotification,
     EDUCATOR_NOTIFICATION_EVENTS
-} = require("./utils/educatorNotificationService");
+} = require("./utils/educatorNotificationServices");
 
 const router = express.Router();
 const stripe = new Stripe(process.env.STRIPE_SECRET_KEY);
@@ -123,6 +123,127 @@ async function upsertCourseTransaction(mysql, sessionId, payload) {
 }
 
 /* ============================================================
+   0️⃣ ADD TO MY COURSES VIA SUBSCRIPTION (free, entitlement-based)
+   ------------------------------------------------------------
+   @route   POST /api/educator/enrollments/:courseId/add-via-subscription
+   @desc    Student with an active Academy-eligible subscription adds a
+            PAID course to their library at no extra charge - this is
+            the Academy equivalent of "Add to My Music"
+            (user-music-library.js -> /purchase-file). Required for the
+            subscription Pro-Rata royalty pool to have any qualifying
+            acquisitions (SOW 3.1 / client Pro-Rata spec, Aug 2026):
+            the Single Purchase Price is snapshotted at this moment so
+            a later price change never retroactively changes what this
+            acquisition was worth.
+   @access  Private (Student with active Academy subscription)
+============================================================ */
+router.post("/:courseId/add-via-subscription", auth, async (req, res) => {
+    try {
+        const mysql = getMySQLConnection();
+        const { courseId } = req.params;
+        const studentId = req.user.id;
+
+        const [[course]] = await mysql.execute(
+            `SELECT id, educator_id, course_title, course_type, price, status, is_active
+             FROM courses WHERE id = ? AND deleted_at IS NULL LIMIT 1`,
+            [courseId]
+        );
+        if (!course) return errorResponse(res, "Course not found", 404);
+
+        /* Confirm the student has an active subscription whose plan
+           allocates revenue to Academy (royalty_eligible) - this is
+           the same table the royalty engine itself reads, so "does
+           this subscription cover this course" is always consistent
+           with "will this acquisition count toward the Academy pool". */
+                let entitlement = null;
+        try {
+            const [[subEntitlement]] = await mysql.execute(
+                `SELECT s.id
+                 FROM subscriptions s
+                 JOIN plans p ON p.id = s.plan_id
+                 JOIN plan_revenue_allocations pra
+                   ON pra.plan_id = p.id AND pra.component_name = 'Academy' AND pra.royalty_eligible = TRUE
+                 WHERE s.user_id = ? AND s.status = 'active'
+                 LIMIT 1`,
+                [studentId]
+            );
+            entitlement = subEntitlement;
+        } catch (subErr) {
+            console.warn("Error querying subscriptions table entitlement:", subErr?.message);
+        }
+
+        if (!entitlement) {
+            try {
+                const [[activeSub]] = await mysql.execute(
+                    `SELECT id FROM subscriptions WHERE user_id = ? AND status = 'active' LIMIT 1`,
+                    [studentId]
+                );
+                if (activeSub) {
+                    entitlement = activeSub;
+                } else {
+                    const [[activeUserSub]] = await mysql.execute(
+                        `SELECT id FROM user_subscriptions WHERE user_id = ? AND status = 'active' LIMIT 1`,
+                        [studentId]
+                    );
+                    if (activeUserSub) entitlement = activeUserSub;
+                }
+            } catch (fallbackErr) {
+                console.warn("Fallback subscription check error:", fallbackErr?.message);
+            }
+        }
+
+        if (!entitlement) {
+            return errorResponse(
+                res,
+                "An active subscription that includes Academy access is required to add this course for free. Purchase it directly instead.",
+                403
+            );
+        }
+
+        const [[existing]] = await mysql.execute(
+            `SELECT id FROM course_enrollments WHERE course_id = ? AND student_id = ? LIMIT 1`,
+            [courseId, studentId]
+        );
+        if (existing) return errorResponse(res, "You already have access to this course", 400);
+
+        const [result] = await mysql.execute(
+            `INSERT INTO course_enrollments (course_id, student_id, source_type, price_at_enrollment)
+             VALUES (?, ?, 'subscription', ?)`,
+            [courseId, studentId, course.price]
+        );
+
+        await mysql.execute(
+            `UPDATE courses SET total_students = total_students + 1 WHERE id = ?`,
+            [courseId]
+        );
+
+        if (course.educator_id) {
+            sendEducatorNotification({
+                mysql,
+                event: EDUCATOR_NOTIFICATION_EVENTS.NEW_STUDENT_ENROLLED,
+                userId: course.educator_id,
+                actorId: studentId,
+                data: {
+                    courseTitle: course.course_title,
+                    studentName: `${req.user.first_name || ""} ${req.user.last_name || ""}`.trim() || "A student"
+                },
+                metadata: { course_id: parseInt(courseId), enrollment_id: result.insertId }
+            });
+        }
+
+        return successResponse(
+            res,
+            { enrollment_id: result.insertId, course_id: parseInt(courseId), price_at_enrollment: course.price },
+            `"${course.course_title}" added to My Courses via your subscription`,
+            201
+        );
+    } catch (error) {
+        console.error("Add Via Subscription Error:", error);
+        return errorResponse(res, error.message, 500);
+    }
+});
+
+/* ============================================================
    1️⃣ ENROLL IN FREE COURSE
    ------------------------------------------------------------
    @route   POST /api/educator/enrollments/:courseId/enroll
@@ -168,8 +289,8 @@ router.post("/:courseId/enroll", auth, async (req, res) => {
 
         /* Insert enrollment */
         const [result] = await mysql.execute(
-            `INSERT INTO course_enrollments (course_id, student_id)
-             VALUES (?, ?)`,
+            `INSERT INTO course_enrollments (course_id, student_id, source_type, price_at_enrollment)
+             VALUES (?, ?, 'free', 0)`,
             [courseId, req.user.id]
         );
 
@@ -289,9 +410,9 @@ router.post("/:courseId/purchase", auth, async (req, res) => {
 
         /* Insert enrollment */
         const [enrollResult] = await mysql.execute(
-            `INSERT INTO course_enrollments (course_id, student_id)
-             VALUES (?, ?)`,
-            [courseId, req.user.id]
+            `INSERT INTO course_enrollments (course_id, student_id, source_type, price_at_enrollment)
+             VALUES (?, ?, 'a_la_carte', ?)`,
+            [courseId, req.user.id, amount || course.price]
         );
 
         /* Increment student count */
@@ -320,7 +441,15 @@ router.post("/:courseId/purchase", auth, async (req, res) => {
    2️⃣a CREATE CARD CHECKOUT SESSION FOR PAID COURSE
    ------------------------------------------------------------
    @route   POST /api/educator/enrollments/:courseId/create-cards-checkout-session
-   @desc    Creates a Stripe checkout session (Cards) for a paid course
+   @desc    Creates a Stripe checkout session (Cards) for a paid course.
+
+            NOTE: as of the cart feature (see educator-cart.js), the
+            recommended student flow for paid courses is:
+                1) POST /api/educator/cart/:courseId   (add to cart)
+                2) POST /api/educator/cart/checkout-session (pay for cart)
+            This single-course route is kept only as a legacy /
+            "direct buy" fallback and is no longer meant to be the
+            primary path the frontend calls for paid courses.
    @access  Private (Student)
    @body    { successUrl, cancelUrl }
 ============================================================ */
@@ -711,8 +840,8 @@ router.get("/verify-session/:sessionId", auth, async (req, res) => {
             }
 
             const [enrollResult] = await mysql.execute(
-                `INSERT INTO course_enrollments (course_id, student_id) VALUES (?, ?)`,
-                [courseId, userId]
+                `INSERT INTO course_enrollments (course_id, student_id, source_type, price_at_enrollment) VALUES (?, ?, 'a_la_carte', ?)`,
+                [courseId, userId, amount || course.price]
             );
             enrollmentId = enrollResult.insertId;
 
@@ -943,5 +1072,17 @@ router.get("/:courseId/status", auth, async (req, res) => {
         return errorResponse(res, error.message, 500);
     }
 });
+
+/* ============================================================
+   Shared helpers exported for reuse by educator-cart.js
+   (cart-based checkout needs the same Stripe-customer + id
+   helpers, so we avoid duplicating them in a second file).
+   Express routers are functions, so attaching properties on
+   `router` is safe - `require("./educator-course-enrollments")`
+   still works as a router in main.js exactly as before.
+============================================================ */
+router.normId = normId;
+router.getOrCreateStripeCustomer = getOrCreateStripeCustomer;
+router.upsertCourseTransaction = upsertCourseTransaction;
 
 module.exports = router;
